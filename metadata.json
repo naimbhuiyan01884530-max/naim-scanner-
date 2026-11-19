@@ -1,0 +1,6 @@
+{
+  "name": "Naim Scanner",
+  "description": "Offline document scanner, 4-corner perspective cropper, enhancer, and lightweight PDF maker.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
