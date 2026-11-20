@@ -147,17 +147,3 @@ enum class SignaturePlacement(val label: String) {
     BOTTOM_CENTER("Bottom Center"),
     BOTTOM_LEFT("Bottom Left")
 }
-
-data class DrawStroke(
-    val points: List<NormalizedPoint>,
-    val colorArgb: Int,
-    val strokeWidthFraction: Float = 0.007f,
-    val isHighlighter: Boolean = false
-)
-
-enum class PhotoSharpness(val label: String) {
-    SHARP("Sharp"),
-    SOFT("Fair"),
-    BLURRY("Blurry")
-}
-

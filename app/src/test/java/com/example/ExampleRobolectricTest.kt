@@ -11,14 +11,12 @@ import com.example.engine.ImageProcessor
 import com.example.engine.PdfEngine
 import com.example.engine.PdfImageInput
 import com.example.engine.ScannerCache
-import com.example.model.DrawStroke
 import com.example.model.FilterMode
 import com.example.model.NormalizedPoint
 import com.example.model.PdfMargin
 import com.example.model.PdfPageLayout
 import com.example.model.PdfPageSize
 import com.example.model.PdfQualityPreset
-import com.example.model.PhotoSharpness
 import com.example.model.QuadCorners
 import com.example.model.SignaturePlacement
 import kotlinx.coroutines.runBlocking
@@ -83,35 +81,9 @@ class ExampleRobolectricTest {
         )
         assertEquals(enhancedBw.width, signed.width)
 
-        val drawn = ImageProcessor.drawStrokesOnBitmap(
-            source = signed,
-            strokes = listOf(
-                DrawStroke(
-                    points = listOf(NormalizedPoint(0.2f, 0.2f), NormalizedPoint(0.8f, 0.8f)),
-                    colorArgb = Color.MAGENTA,
-                    strokeWidthFraction = 0.01f,
-                    isHighlighter = false
-                ),
-                DrawStroke(
-                    points = listOf(NormalizedPoint(0.3f, 0.4f), NormalizedPoint(0.7f, 0.4f)),
-                    colorArgb = Color.YELLOW,
-                    strokeWidthFraction = 0.015f,
-                    isHighlighter = true
-                )
-            )
-        )
-        assertEquals(signed.width, drawn.width)
-
         val thumbFile = File(context.cacheDir, "unit_thumb.jpg")
-        ImageProcessor.saveThumbnail(drawn, thumbFile)
+        ImageProcessor.saveThumbnail(signed, thumbFile)
         assertTrue(thumbFile.exists() && thumbFile.length() > 0)
-
-        val flatFile = File(context.cacheDir, "unit_blurry.jpg")
-        val flatBmp = Bitmap.createBitmap(160, 160, Bitmap.Config.ARGB_8888)
-        Canvas(flatBmp).drawColor(Color.LTGRAY)
-        ImageProcessor.saveBitmapJpeg(flatBmp, flatFile, 90)
-        flatBmp.recycle()
-        assertEquals(PhotoSharpness.BLURRY, ImageProcessor.estimatePhotoSharpness(flatFile.absolutePath))
 
         val cached1 = ImageProcessor.decodeFileCached(thumbFile.absolutePath, 400)
         val cached2 = ImageProcessor.decodeFileCached(thumbFile.absolutePath, 400)
@@ -182,29 +154,6 @@ class ExampleRobolectricTest {
         ImageProcessor.saveBitmapJpeg(bmp, img3, 90)
         bmp.recycle()
 
-        val hiResFile = File(context.cacheDir, "hires_est.jpg")
-        val hiResBmp = Bitmap.createBitmap(2200, 2800, Bitmap.Config.ARGB_8888)
-        val hiCanvas = Canvas(hiResBmp)
-        hiCanvas.drawColor(Color.WHITE)
-        val hiPaint = Paint().apply { color = Color.DKGRAY; textSize = 60f }
-        for (row in 1..12) {
-            hiCanvas.drawText("Line $row: Sample scanned invoice content 1234567890", 120f, row * 200f, hiPaint)
-        }
-        ImageProcessor.saveBitmapJpeg(hiResBmp, hiResFile, 94)
-        hiResBmp.recycle()
-
-        val estSmall = PdfEngine.estimateExportSizeBytes(
-            pages = listOf(hiResFile.absolutePath to FilterMode.CLEAN_GRAY, hiResFile.absolutePath to FilterMode.COLOR_BOOST),
-            qualityPreset = PdfQualityPreset.SMALL,
-            pageLayout = PdfPageLayout.SINGLE
-        )
-        val estUltra = PdfEngine.estimateExportSizeBytes(
-            pages = listOf(hiResFile.absolutePath to FilterMode.CLEAN_GRAY, hiResFile.absolutePath to FilterMode.COLOR_BOOST),
-            qualityPreset = PdfQualityPreset.ULTRA_HD,
-            pageLayout = PdfPageLayout.SINGLE
-        )
-        assertTrue("Expected estUltra ($estUltra) > estSmall ($estSmall) > 0", estSmall > 0 && estUltra > estSmall)
-
         val outTwoUp = File(context.cacheDir, "two_up_out.pdf")
         val (bytesWritten, pageCount) = PdfEngine.buildPdfFromImages(
             imageFiles = listOf(
@@ -270,23 +219,6 @@ class ExampleRobolectricTest {
         // Batch delete duplicated page
         repo.batchDeletePages(docId, setOf(dupPageId))
         assertEquals(2, repo.documents.value.first { it.id == docId }.pages.size)
-
-        // Reorder page serial & draw multi-color strokes on page
-        val currentPages = repo.documents.value.first { it.id == docId }.pages
-        val reversedIds = currentPages.map { it.id }.reversed()
-        repo.reorderPages(docId, reversedIds)
-        assertEquals(reversedIds, repo.documents.value.first { it.id == docId }.pages.map { it.id })
-
-        repo.drawStrokesOnPage(
-            pageId = firstPage.id,
-            strokes = listOf(
-                DrawStroke(
-                    points = listOf(NormalizedPoint(0.25f, 0.25f), NormalizedPoint(0.75f, 0.75f)),
-                    colorArgb = Color.CYAN,
-                    strokeWidthFraction = 0.008f
-                )
-            )
-        )
 
         val pdf = repo.exportDocumentToPdf(
             documentId = docId,

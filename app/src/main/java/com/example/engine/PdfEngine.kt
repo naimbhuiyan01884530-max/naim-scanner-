@@ -1,12 +1,10 @@
 package com.example.engine
 
 import android.graphics.Bitmap
-import android.graphics.BitmapFactory
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.pdf.PdfRenderer
 import android.os.ParcelFileDescriptor
-import com.example.model.DrawStroke
 import com.example.model.FilterMode
 import com.example.model.PdfMargin
 import com.example.model.PdfPageLayout
@@ -17,9 +15,7 @@ import java.io.File
 import java.io.FileOutputStream
 import java.security.MessageDigest
 import java.util.Locale
-import kotlin.math.max
 import kotlin.math.min
-import kotlin.math.pow
 import kotlin.math.roundToInt
 
 data class PdfImageInput(
@@ -39,66 +35,6 @@ object PdfEngine {
         if (kb < 1024.0) return String.format(Locale.US, "%.0f KB", kb)
         val mb = kb / 1024.0
         return String.format(Locale.US, "%.2f MB", mb)
-    }
-
-    /**
-     * Fast (<15ms) offline estimation of the exported PDF file size for the selected pages,
-     * quality preset, layout, and watermark option.
-     */
-    fun estimateExportSizeBytes(
-        pages: List<Pair<String, FilterMode>>,
-        qualityPreset: PdfQualityPreset,
-        pageLayout: PdfPageLayout,
-        watermarkText: String = ""
-    ): Long {
-        if (pages.isEmpty()) return 0L
-        var totalBytes = 600L
-
-        if (pageLayout == PdfPageLayout.TWO_UP_ID) {
-            val chunks = pages.chunked(2)
-            val sheetW = (qualityPreset.maxLongEdgePx * 0.707).coerceAtLeast(800.0)
-            val sheetH = qualityPreset.maxLongEdgePx.toDouble().coerceAtLeast(1130.0)
-            val qRatio = (qualityPreset.jpegQuality / 94.0).pow(1.45)
-            val perSheet = (sheetW * sheetH * 0.058 * qRatio).roundToInt().coerceAtLeast(18_000)
-            totalBytes += chunks.size * (perSheet + 650L)
-            return totalBytes
-        }
-
-        for ((path, mode) in pages) {
-            val file = File(path)
-            val fileLen = file.length().coerceAtLeast(12_000L)
-            val opts = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-            if (file.exists()) {
-                BitmapFactory.decodeFile(path, opts)
-            }
-            val srcW = opts.outWidth.coerceAtLeast(1200)
-            val srcH = opts.outHeight.coerceAtLeast(1600)
-            val srcLong = max(srcW, srcH)
-            val scale = (qualityPreset.maxLongEdgePx.toFloat() / srcLong).coerceAtMost(1f)
-            val tw = (srcW * scale).roundToInt().coerceAtLeast(1)
-            val th = (srcH * scale).roundToInt().coerceAtLeast(1)
-
-            val usesFlate1Bit = mode == FilterMode.SHARP_BW &&
-                watermarkText.isBlank() &&
-                qualityPreset.maxLongEdgePx >= 2480
-
-            val pageEstimate = if (usesFlate1Bit) {
-                // Packed 1-bit FlateDecode text scan: ~0.008 to 0.015 bytes/px depending on text density
-                val pixels = tw.toDouble() * th.toDouble()
-                (pixels * 0.0115).roundToInt().coerceIn(28_000, 180_000).toLong()
-            } else {
-                val targetQuality = if (mode == FilterMode.SHARP_BW || mode == FilterMode.GRAYSCALE) {
-                    qualityPreset.bwJpegQuality
-                } else {
-                    qualityPreset.jpegQuality
-                }
-                val areaScale = scale.toDouble() * scale.toDouble()
-                val qualityScale = (targetQuality / 94.0).pow(1.55)
-                (fileLen * areaScale * qualityScale).roundToInt().coerceAtLeast(4_000).toLong()
-            }
-            totalBytes += pageEstimate + 650L
-        }
-        return totalBytes
     }
 
     fun buildPdfFromImages(
@@ -488,64 +424,6 @@ object PdfEngine {
             }
         }
         return result
-    }
-
-    fun annotatePdfPages(
-        sourcePdfPath: String,
-        annotationsByPage: Map<Int, List<DrawStroke>>,
-        outFile: File,
-        pageSize: PdfPageSize = PdfPageSize.A4,
-        qualityPreset: PdfQualityPreset = PdfQualityPreset.HIGH,
-        password: String = ""
-    ): Pair<Long, Int> {
-        val file = File(sourcePdfPath)
-        require(file.exists()) { "Source PDF missing" }
-        val renderEdge = max(qualityPreset.maxLongEdgePx, PdfQualityPreset.HIGH.maxLongEdgePx)
-        val inputs = mutableListOf<PdfImageInput>()
-
-        ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY).use { pfd ->
-            PdfRenderer(pfd).use { renderer ->
-                for (i in 0 until renderer.pageCount) {
-                    renderer.openPage(i).use { page ->
-                        val scale = renderEdge.toFloat() / maxOf(page.width, page.height).coerceAtLeast(1)
-                        val w = (page.width * scale).roundToInt().coerceAtLeast(200)
-                        val h = (page.height * scale).roundToInt().coerceAtLeast(200)
-                        val base = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
-                        Canvas(base).drawColor(Color.WHITE)
-                        page.render(base, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
-
-                        val strokes = annotationsByPage[i]
-                        val painted = if (!strokes.isNullOrEmpty()) {
-                            ImageProcessor.drawStrokesOnBitmap(base, strokes).also {
-                                base.recycle()
-                            }
-                        } else {
-                            base
-                        }
-
-                        val encoded = ImageProcessor.encodePageForPdf(
-                            source = painted,
-                            filterMode = FilterMode.ORIGINAL,
-                            qualityPreset = qualityPreset
-                        )
-                        painted.recycle()
-                        inputs.add(
-                            PdfImageInput(
-                                jpegBytes = encoded.streamBytes,
-                                widthPx = encoded.widthPx,
-                                heightPx = encoded.heightPx,
-                                colorSpace = encoded.colorSpace,
-                                bitsPerComponent = encoded.bitsPerComponent,
-                                filterName = encoded.filterName
-                            )
-                        )
-                    }
-                }
-            }
-        }
-        require(inputs.isNotEmpty()) { "PDF has no pages" }
-        val bytes = writePdfBytes(inputs, outFile, pageSize, PdfMargin.NONE.marginPt, password)
-        return bytes to inputs.size
     }
 
     // ---- Standard PDF 1.4 RC4-128 Security Handler (Spec Algorithms 3.2 - 3.5) ----

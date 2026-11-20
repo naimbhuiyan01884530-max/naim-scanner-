@@ -10,11 +10,9 @@ import android.graphics.Paint
 import android.graphics.Path
 import android.media.ExifInterface
 import android.net.Uri
-import com.example.model.DrawStroke
 import com.example.model.FilterMode
 import com.example.model.NormalizedPoint
 import com.example.model.PdfQualityPreset
-import com.example.model.PhotoSharpness
 import com.example.model.QuadCorners
 import com.example.model.SignaturePlacement
 import java.io.ByteArrayOutputStream
@@ -594,103 +592,6 @@ object ImageProcessor {
             canvas.drawPath(path, paint)
         }
         return copy
-    }
-
-    /**
-     * Stamps multi-color freehand pen and highlighter strokes onto a full page or PDF bitmap.
-     */
-    fun drawStrokesOnBitmap(
-        source: Bitmap,
-        strokes: List<DrawStroke>
-    ): Bitmap {
-        val copy = source.copy(Bitmap.Config.ARGB_8888, true)
-        if (strokes.isEmpty()) return copy
-        val canvas = Canvas(copy)
-        val w = copy.width.toFloat()
-        val h = copy.height.toFloat()
-        val minDim = min(w, h)
-
-        for (stroke in strokes) {
-            if (stroke.points.isEmpty()) continue
-            val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                val baseColor = stroke.colorArgb
-                color = if (stroke.isHighlighter) {
-                    Color.argb(96, Color.red(baseColor), Color.green(baseColor), Color.blue(baseColor))
-                } else {
-                    baseColor
-                }
-                style = Paint.Style.STROKE
-                strokeCap = Paint.Cap.ROUND
-                strokeJoin = Paint.Join.ROUND
-                val mult = if (stroke.isHighlighter) 2.6f else 1f
-                strokeWidth = (minDim * stroke.strokeWidthFraction * mult).coerceIn(3f, 84f)
-            }
-            if (stroke.points.size == 1) {
-                val pt = stroke.points[0]
-                paint.style = Paint.Style.FILL
-                canvas.drawCircle(pt.x * w, pt.y * h, paint.strokeWidth * 0.5f, paint)
-            } else {
-                val path = Path()
-                path.moveTo(stroke.points[0].x * w, stroke.points[0].y * h)
-                for (i in 1 until stroke.points.size) {
-                    path.lineTo(stroke.points[i].x * w, stroke.points[i].y * h)
-                }
-                canvas.drawPath(path, paint)
-            }
-        }
-        return copy
-    }
-
-    /**
-     * Fast offline Laplacian sharpness check on center 70% region to flag blurry batch captures.
-     */
-    fun estimatePhotoSharpness(filePath: String): PhotoSharpness {
-        val sample = decodeFileNormalized(filePath, 260) ?: return PhotoSharpness.SOFT
-        val w = sample.width
-        val h = sample.height
-        if (w < 24 || h < 24) {
-            sample.recycle()
-            return PhotoSharpness.SOFT
-        }
-        val pixels = IntArray(w * h)
-        sample.getPixels(pixels, 0, w, 0, 0, w, h)
-        sample.recycle()
-
-        val lum = FloatArray(w * h)
-        for (i in pixels.indices) {
-            val c = pixels[i]
-            val r = (c shr 16) and 0xFF
-            val g = (c shr 8) and 0xFF
-            val b = c and 0xFF
-            lum[i] = 0.299f * r + 0.587f * g + 0.114f * b
-        }
-
-        val x0 = (w * 0.15f).roundToInt().coerceAtLeast(1)
-        val x1 = (w * 0.85f).roundToInt().coerceAtMost(w - 2)
-        val y0 = (h * 0.15f).roundToInt().coerceAtLeast(1)
-        val y1 = (h * 0.85f).roundToInt().coerceAtMost(h - 2)
-
-        var sum = 0.0
-        var sumSq = 0.0
-        var count = 0
-        for (y in y0..y1) {
-            val row = y * w
-            for (x in x0..x1) {
-                val idx = row + x
-                val lap = 4.0 * lum[idx] - lum[idx - 1] - lum[idx + 1] - lum[idx - w] - lum[idx + w]
-                sum += lap
-                sumSq += lap * lap
-                count++
-            }
-        }
-        if (count == 0) return PhotoSharpness.SOFT
-        val mean = sum / count
-        val variance = (sumSq / count) - (mean * mean)
-        return when {
-            variance < 95.0 -> PhotoSharpness.BLURRY
-            variance < 240.0 -> PhotoSharpness.SOFT
-            else -> PhotoSharpness.SHARP
-        }
     }
 
     fun composeTwoUpPage(topBmp: Bitmap, bottomBmp: Bitmap?, targetLongEdge: Int): Bitmap {

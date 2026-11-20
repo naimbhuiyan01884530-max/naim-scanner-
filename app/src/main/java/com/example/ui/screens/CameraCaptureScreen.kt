@@ -19,12 +19,9 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.gestures.detectTapGestures
-import androidx.compose.foundation.gestures.detectTransformGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -35,26 +32,17 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.lazy.LazyRow
-import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.filled.ArrowBack
-import androidx.compose.material.icons.automirrored.filled.KeyboardArrowLeft
-import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
-import androidx.compose.material.icons.filled.AddAPhoto
 import androidx.compose.material.icons.filled.AutoFixHigh
 import androidx.compose.material.icons.filled.CameraAlt
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Close
-import androidx.compose.material.icons.filled.DeleteOutline
 import androidx.compose.material.icons.filled.FlashAuto
 import androidx.compose.material.icons.filled.FlashOff
 import androidx.compose.material.icons.filled.FlashOn
 import androidx.compose.material.icons.filled.Highlight
-import androidx.compose.material.icons.filled.Refresh
-import androidx.compose.material.icons.filled.WarningAmber
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
@@ -63,20 +51,16 @@ import androidx.compose.material3.FilterChipDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateListOf
-import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -85,8 +69,6 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.drawscope.Stroke
-import androidx.compose.ui.graphics.graphicsLayer
-import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
@@ -98,16 +80,11 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
 import coil.compose.AsyncImage
 import com.example.R
 import com.example.engine.ImageProcessor
-import com.example.model.PhotoSharpness
 import com.example.model.QuadCorners
 import com.example.ui.theme.ObsidianBg
-import com.example.ui.theme.ObsidianBorder
 import com.example.ui.theme.ObsidianSurface
 import com.example.ui.theme.TealAccent
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 import java.io.File
 import java.util.concurrent.Executors
 
@@ -199,10 +176,6 @@ fun CameraCaptureScreen(
     var autoDetect by remember { mutableStateOf(true) }
     var pendingSaves by remember { mutableIntStateOf(0) }
     val capturedFiles = remember { mutableStateListOf<File>() }
-    val sharpnessMap = remember { mutableStateMapOf<String, PhotoSharpness>() }
-    var showBatchReview by remember { mutableStateOf(false) }
-    var reviewIndex by remember { mutableIntStateOf(0) }
-    val scope = rememberCoroutineScope()
     var cameraRef by remember { mutableStateOf<Camera?>(null) }
     var imageCaptureRef by remember { mutableStateOf<ImageCapture?>(null) }
     var captureFlashPulse by remember { mutableIntStateOf(0) }
@@ -486,31 +459,21 @@ fun CameraCaptureScreen(
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.SpaceBetween
             ) {
-                // Live batch thumbnail + count + tap to preview & remove blurry shots
+                // Live batch thumbnail + count + background save indicator
                 Box(
-                    modifier = Modifier
-                        .size(56.dp)
-                        .clickable(enabled = capturedFiles.isNotEmpty() && !singleShotMode) {
-                            reviewIndex = capturedFiles.lastIndex.coerceAtLeast(0)
-                            showBatchReview = true
-                        },
+                    modifier = Modifier.size(56.dp),
                     contentAlignment = Alignment.Center
                 ) {
                     val lastFile = capturedFiles.lastOrNull()
                     if (lastFile != null) {
-                        val lastSharpness = sharpnessMap[lastFile.absolutePath]
                         AsyncImage(
                             model = lastFile,
-                            contentDescription = "Preview captured photos",
+                            contentDescription = "Last captured page",
                             contentScale = ContentScale.Crop,
                             modifier = Modifier
                                 .size(52.dp)
                                 .clip(RoundedCornerShape(10.dp))
-                                .border(
-                                    width = 1.5.dp,
-                                    color = if (lastSharpness == PhotoSharpness.BLURRY) MaterialTheme.colorScheme.error else TealAccent,
-                                    shape = RoundedCornerShape(10.dp)
-                                )
+                                .border(1.5.dp, TealAccent, RoundedCornerShape(10.dp))
                         )
                         Box(
                             modifier = Modifier
@@ -567,13 +530,6 @@ fun CameraCaptureScreen(
                                             capturedFiles.add(outFile)
                                             if (singleShotMode) {
                                                 onFinishBatch(capturedFiles.toList(), autoDetect)
-                                            } else {
-                                                scope.launch(Dispatchers.IO) {
-                                                    val s = ImageProcessor.estimatePhotoSharpness(outFile.absolutePath)
-                                                    withContext(Dispatchers.Main) {
-                                                        sharpnessMap[outFile.absolutePath] = s
-                                                    }
-                                                }
                                             }
                                         }
                                     }
@@ -597,13 +553,10 @@ fun CameraCaptureScreen(
                     )
                 }
 
-                // Review / Done button
+                // Done button
                 if (!singleShotMode) {
                     Button(
-                        onClick = {
-                            reviewIndex = 0
-                            showBatchReview = true
-                        },
+                        onClick = { onFinishBatch(capturedFiles.toList(), autoDetect) },
                         enabled = capturedFiles.isNotEmpty() && pendingSaves == 0,
                         colors = ButtonDefaults.buttonColors(
                             containerColor = TealAccent,
@@ -619,285 +572,12 @@ fun CameraCaptureScreen(
                         Icon(Icons.Filled.Check, contentDescription = null, modifier = Modifier.size(18.dp))
                         Spacer(Modifier.width(4.dp))
                         Text(
-                            text = if (capturedFiles.isEmpty()) "Review"
-                            else "Review (${capturedFiles.size})"
+                            text = if (capturedFiles.isEmpty()) stringResource(R.string.action_done)
+                            else "${stringResource(R.string.action_done)} (${capturedFiles.size})"
                         )
                     }
                 } else {
                     Spacer(Modifier.width(80.dp))
-                }
-            }
-        }
-
-        // Batch Photo Preview & Blurry Shot Removal Overlay
-        if (showBatchReview && capturedFiles.isNotEmpty()) {
-            BackHandler {
-                showBatchReview = false
-            }
-            val safeIdx = reviewIndex.coerceIn(0, capturedFiles.lastIndex)
-            val currentFile = capturedFiles[safeIdx]
-            val currentSharpness = sharpnessMap[currentFile.absolutePath]
-            var zoomScale by remember(currentFile.absolutePath) { mutableFloatStateOf(1f) }
-            var panOffset by remember(currentFile.absolutePath) { mutableStateOf(Offset.Zero) }
-
-            Column(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .background(ObsidianBg)
-                    .statusBarsPadding()
-                    .navigationBarsPadding()
-            ) {
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(horizontal = 8.dp, vertical = 8.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    IconButton(onClick = { showBatchReview = false }) {
-                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back to camera")
-                    }
-                    Column(modifier = Modifier.weight(1f)) {
-                        Text(
-                            text = "Preview Batch (${safeIdx + 1}/${capturedFiles.size})",
-                            style = MaterialTheme.typography.titleMedium
-                        )
-                        val blurryCount = capturedFiles.count { sharpnessMap[it.absolutePath] == PhotoSharpness.BLURRY }
-                        Text(
-                            text = if (blurryCount > 0) "$blurryCount photo(s) look blurry · pinch to inspect"
-                            else "Pinch to zoom · drop unwanted shots",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = if (blurryCount > 0) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-                    }
-                    Button(
-                        onClick = { onFinishBatch(capturedFiles.toList(), autoDetect) },
-                        colors = ButtonDefaults.buttonColors(
-                            containerColor = TealAccent,
-                            contentColor = MaterialTheme.colorScheme.onPrimary
-                        ),
-                        shape = RoundedCornerShape(12.dp),
-                        modifier = Modifier.testTag("batch_review_save")
-                    ) {
-                        Icon(Icons.Filled.Check, contentDescription = null, modifier = Modifier.size(16.dp))
-                        Spacer(Modifier.width(4.dp))
-                        Text("Save (${capturedFiles.size})")
-                    }
-                }
-
-                // Zoomable Full-Screen Shot Preview
-                Box(
-                    modifier = Modifier
-                        .weight(1f)
-                        .fillMaxWidth()
-                        .padding(horizontal = 14.dp, vertical = 4.dp)
-                        .clip(RoundedCornerShape(16.dp))
-                        .background(ObsidianSurface)
-                        .border(1.dp, ObsidianBorder, RoundedCornerShape(16.dp))
-                        .pointerInput(currentFile.absolutePath) {
-                            detectTapGestures(
-                                onDoubleTap = {
-                                    if (zoomScale > 1.2f) {
-                                        zoomScale = 1f
-                                        panOffset = Offset.Zero
-                                    } else {
-                                        zoomScale = 2.6f
-                                    }
-                                }
-                            )
-                        }
-                        .pointerInput(currentFile.absolutePath) {
-                            detectTransformGestures { _, pan, zoom, _ ->
-                                val newScale = (zoomScale * zoom).coerceIn(1f, 5f)
-                                zoomScale = newScale
-                                panOffset = if (newScale <= 1.05f) Offset.Zero else panOffset + pan
-                            }
-                        },
-                    contentAlignment = Alignment.Center
-                ) {
-                    AsyncImage(
-                        model = currentFile,
-                        contentDescription = "Captured photo ${safeIdx + 1}",
-                        contentScale = ContentScale.Fit,
-                        modifier = Modifier
-                            .fillMaxSize()
-                            .graphicsLayer {
-                                scaleX = zoomScale
-                                scaleY = zoomScale
-                                translationX = panOffset.x
-                                translationY = panOffset.y
-                            }
-                    )
-
-                    if (currentSharpness != null) {
-                        val badgeColor = when (currentSharpness) {
-                            PhotoSharpness.SHARP -> TealAccent
-                            PhotoSharpness.SOFT -> MaterialTheme.colorScheme.secondary
-                            PhotoSharpness.BLURRY -> MaterialTheme.colorScheme.error
-                        }
-                        Surface(
-                            color = ObsidianBg.copy(alpha = 0.86f),
-                            shape = RoundedCornerShape(10.dp),
-                            modifier = Modifier
-                                .align(Alignment.TopStart)
-                                .padding(10.dp)
-                        ) {
-                            Row(
-                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp),
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                if (currentSharpness == PhotoSharpness.BLURRY) {
-                                    Icon(
-                                        Icons.Filled.WarningAmber,
-                                        contentDescription = null,
-                                        tint = badgeColor,
-                                        modifier = Modifier.size(15.dp)
-                                    )
-                                    Spacer(Modifier.width(4.dp))
-                                }
-                                Text(
-                                    text = currentSharpness.label,
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = badgeColor
-                                )
-                            }
-                        }
-                    }
-
-                    if (safeIdx > 0) {
-                        IconButton(
-                            onClick = { reviewIndex = safeIdx - 1 },
-                            modifier = Modifier
-                                .align(Alignment.CenterStart)
-                                .padding(6.dp)
-                                .size(40.dp)
-                                .clip(CircleShape)
-                                .background(ObsidianBg.copy(alpha = 0.72f))
-                        ) {
-                            Icon(Icons.AutoMirrored.Filled.KeyboardArrowLeft, contentDescription = "Previous photo", tint = Color.White)
-                        }
-                    }
-
-                    if (safeIdx < capturedFiles.lastIndex) {
-                        IconButton(
-                            onClick = { reviewIndex = safeIdx + 1 },
-                            modifier = Modifier
-                                .align(Alignment.CenterEnd)
-                                .padding(6.dp)
-                                .size(40.dp)
-                                .clip(CircleShape)
-                                .background(ObsidianBg.copy(alpha = 0.72f))
-                        ) {
-                            Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, contentDescription = "Next photo", tint = Color.White)
-                        }
-                    }
-                }
-
-                // Discard Blurry / Retake / Add More Buttons
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(horizontal = 14.dp, vertical = 8.dp),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    OutlinedButton(
-                        onClick = {
-                            val removed = capturedFiles.removeAt(safeIdx)
-                            sharpnessMap.remove(removed.absolutePath)
-                            removed.delete()
-                            if (capturedFiles.isEmpty()) {
-                                showBatchReview = false
-                            } else {
-                                reviewIndex = safeIdx.coerceAtMost(capturedFiles.lastIndex)
-                            }
-                        },
-                        modifier = Modifier.weight(1f),
-                        colors = ButtonDefaults.outlinedButtonColors(contentColor = MaterialTheme.colorScheme.error)
-                    ) {
-                        Icon(Icons.Filled.DeleteOutline, contentDescription = null, modifier = Modifier.size(17.dp))
-                        Spacer(Modifier.width(4.dp))
-                        Text("Discard")
-                    }
-
-                    OutlinedButton(
-                        onClick = {
-                            val removed = capturedFiles.removeAt(safeIdx)
-                            sharpnessMap.remove(removed.absolutePath)
-                            removed.delete()
-                            reviewIndex = safeIdx.coerceAtMost((capturedFiles.size - 1).coerceAtLeast(0))
-                            showBatchReview = false
-                        },
-                        modifier = Modifier.weight(1f)
-                    ) {
-                        Icon(Icons.Filled.Refresh, contentDescription = null, modifier = Modifier.size(17.dp))
-                        Spacer(Modifier.width(4.dp))
-                        Text("Retake")
-                    }
-
-                    OutlinedButton(
-                        onClick = { showBatchReview = false },
-                        modifier = Modifier.weight(1f)
-                    ) {
-                        Icon(Icons.Filled.AddAPhoto, contentDescription = null, modifier = Modifier.size(17.dp))
-                        Spacer(Modifier.width(4.dp))
-                        Text("Add")
-                    }
-                }
-
-                // Scrollable Batch Thumbnail Strip
-                LazyRow(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(bottom = 10.dp),
-                    contentPadding = PaddingValues(horizontal = 14.dp),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    itemsIndexed(capturedFiles, key = { _, f -> f.absolutePath }) { idx, file ->
-                        val selected = idx == safeIdx
-                        val blurry = sharpnessMap[file.absolutePath] == PhotoSharpness.BLURRY
-                        Box(
-                            modifier = Modifier
-                                .size(width = 56.dp, height = 72.dp)
-                                .clip(RoundedCornerShape(10.dp))
-                                .border(
-                                    width = if (selected) 2.dp else 1.dp,
-                                    color = when {
-                                        selected -> TealAccent
-                                        blurry -> MaterialTheme.colorScheme.error
-                                        else -> ObsidianBorder
-                                    },
-                                    shape = RoundedCornerShape(10.dp)
-                                )
-                                .clickable { reviewIndex = idx }
-                        ) {
-                            AsyncImage(
-                                model = file,
-                                contentDescription = "Photo ${idx + 1}",
-                                contentScale = ContentScale.Crop,
-                                modifier = Modifier.fillMaxSize()
-                            )
-                            Surface(
-                                color = if (selected) TealAccent else ObsidianBg.copy(alpha = 0.78f),
-                                shape = RoundedCornerShape(bottomEnd = 6.dp)
-                            ) {
-                                Text(
-                                    text = "${idx + 1}",
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = if (selected) MaterialTheme.colorScheme.onPrimary else Color.White,
-                                    modifier = Modifier.padding(horizontal = 5.dp, vertical = 1.dp)
-                                )
-                            }
-                            if (blurry) {
-                                Box(
-                                    modifier = Modifier
-                                        .align(Alignment.TopEnd)
-                                        .padding(4.dp)
-                                        .size(10.dp)
-                                        .clip(CircleShape)
-                                        .background(MaterialTheme.colorScheme.error)
-                                )
-                            }
-                        }
-                    }
                 }
             }
         }

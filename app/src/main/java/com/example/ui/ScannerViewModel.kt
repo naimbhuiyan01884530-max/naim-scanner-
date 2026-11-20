@@ -7,7 +7,6 @@ import androidx.lifecycle.viewModelScope
 import com.example.data.ScannerRepository
 import com.example.engine.ImageProcessor
 import com.example.engine.PdfEngine
-import com.example.model.DrawStroke
 import com.example.model.FilterMode
 import com.example.model.FolderModel
 import com.example.model.NormalizedPoint
@@ -370,18 +369,6 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
-    fun drawStrokesOnPage(
-        pageId: Long,
-        strokes: List<DrawStroke>
-    ) {
-        if (strokes.isEmpty()) return
-        viewModelScope.launch {
-            runBusy("Saving drawing…") {
-                repository.drawStrokesOnPage(pageId, strokes)
-            }
-        }
-    }
-
     fun savePageToGallery(imagePath: String, title: String) {
         viewModelScope.launch(Dispatchers.IO) {
             val saved = ShareUtils.saveImageToGallery(getApplication(), File(imagePath), title)
@@ -606,35 +593,6 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
                     }
                 }.onFailure {
                     statusMessage.value = "Cannot convert locked PDF"
-                }
-            }
-        }
-    }
-
-    fun annotatePdf(
-        sourcePdfId: Long,
-        annotationsByPage: Map<Int, List<DrawStroke>>,
-        saveAsCopy: Boolean,
-        onDone: (PdfFileModel?) -> Unit
-    ) {
-        if (annotationsByPage.values.all { it.isEmpty() }) {
-            onDone(null)
-            return
-        }
-        viewModelScope.launch {
-            runBusy("Saving PDF drawing…") {
-                runCatching {
-                    repository.annotatePdfWithStrokes(sourcePdfId, annotationsByPage, saveAsCopy)
-                }.onSuccess { result ->
-                    if (result != null) {
-                        statusMessage.value = if (saveAsCopy) "Saved ${result.title}" else "PDF updated"
-                    } else {
-                        statusMessage.value = "Failed to save PDF drawing"
-                    }
-                    onDone(result)
-                }.onFailure {
-                    statusMessage.value = "Cannot draw on locked PDF"
-                    onDone(null)
                 }
             }
         }

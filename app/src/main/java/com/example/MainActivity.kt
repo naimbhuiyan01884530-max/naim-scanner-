@@ -261,9 +261,6 @@ fun NaimScannerApp(viewModel: ScannerViewModel = viewModel()) {
                             onStampSignature = { page, strokes, placement, colorInt ->
                                 viewModel.stampSignatureOnPage(page.id, strokes, placement, colorInt)
                             },
-                            onDrawOnPage = { page, strokes ->
-                                viewModel.drawStrokesOnPage(page.id, strokes)
-                            },
                             onSavePagePhoto = { page, pageNum ->
                                 viewModel.savePageToGallery(page.enhancedImagePath, "${doc.title}_p$pageNum")
                             },
@@ -328,13 +325,6 @@ fun NaimScannerApp(viewModel: ScannerViewModel = viewModel()) {
                                 viewModel.splitOrReorderPdf(pdf.id, indices, title) { created ->
                                     if (created != null) {
                                         screen = AppScreen.PdfViewer(created.id)
-                                    }
-                                }
-                            },
-                            onAnnotatePdf = { annotationsMap, saveAsCopy ->
-                                viewModel.annotatePdf(pdf.id, annotationsMap, saveAsCopy) { updated ->
-                                    if (updated != null && updated.id != pdf.id) {
-                                        screen = AppScreen.PdfViewer(updated.id)
                                     }
                                 }
                             }

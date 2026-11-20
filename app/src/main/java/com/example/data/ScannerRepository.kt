@@ -9,7 +9,6 @@ import com.example.engine.ImageProcessor
 import com.example.engine.OcrEngine
 import com.example.engine.PdfEngine
 import com.example.engine.ScannerCache
-import com.example.model.DrawStroke
 import com.example.model.FilterMode
 import com.example.model.FolderModel
 import com.example.model.NormalizedPoint
@@ -810,28 +809,6 @@ class ScannerRepository(private val context: Context) {
         refreshAll()
     }
 
-    suspend fun drawStrokesOnPage(
-        pageId: Long,
-        strokes: List<DrawStroke>
-    ) = withContext(Dispatchers.IO) {
-        if (strokes.isEmpty()) return@withContext
-        val page = findPageById(pageId) ?: return@withContext
-        val currentBmp = ImageProcessor.decodeFileNormalized(page.enhancedImagePath) ?: return@withContext
-        val drawn = ImageProcessor.drawStrokesOnBitmap(currentBmp, strokes)
-        currentBmp.recycle()
-        ImageProcessor.saveBitmapJpeg(drawn, File(page.enhancedImagePath), 94)
-
-        val thumbPath = page.thumbImagePath.ifEmpty {
-            page.enhancedImagePath.replace("_enhanced.jpg", "_thumb.jpg")
-        }
-        ImageProcessor.saveThumbnail(drawn, File(thumbPath))
-        drawn.recycle()
-        invalidatePageCaches(page)
-
-        touchDocument(page.documentId)
-        refreshAll()
-    }
-
     suspend fun reorderPages(documentId: Long, orderedPageIds: List<Long>) = withContext(Dispatchers.IO) {
         val db = dbHelper.writableDatabase
         db.beginTransaction()
@@ -1168,60 +1145,6 @@ class ScannerRepository(private val context: Context) {
         )
         tempDir.deleteRecursively()
         docId
-    }
-
-    suspend fun annotatePdfWithStrokes(
-        sourcePdfId: Long,
-        annotationsByPage: Map<Int, List<DrawStroke>>,
-        saveAsCopy: Boolean
-    ): PdfFileModel? = withContext(Dispatchers.IO) {
-        val src = _pdfs.value.find { it.id == sourcePdfId } ?: return@withContext null
-        val cleanTitle = if (saveAsCopy) "${src.title} Drawn" else src.title
-        val targetFile = if (saveAsCopy) {
-            File(pdfsRootDir, "${sanitizeFileName(cleanTitle)}_${System.currentTimeMillis()}.pdf")
-        } else {
-            File(src.filePath)
-        }
-        val tempOut = File(pdfsRootDir, "tmp_draw_${System.currentTimeMillis()}.pdf")
-        val (sizeBytes, pageCount) = PdfEngine.annotatePdfPages(
-            sourcePdfPath = src.filePath,
-            annotationsByPage = annotationsByPage,
-            outFile = tempOut,
-            pageSize = src.pageSize,
-            qualityPreset = src.qualityPreset
-        )
-        if (saveAsCopy) {
-            tempOut.renameTo(targetFile)
-            val newId = insertPdfRecord(
-                title = cleanTitle,
-                filePath = targetFile.absolutePath,
-                sizeBytes = sizeBytes,
-                pageCount = pageCount,
-                pageSize = src.pageSize,
-                qualityPreset = src.qualityPreset,
-                isProtected = false,
-                watermarkText = src.watermarkText,
-                folderName = src.folderName,
-                documentId = src.documentId
-            )
-            refreshAll()
-            _pdfs.value.find { it.id == newId }
-        } else {
-            if (targetFile.exists()) targetFile.delete()
-            tempOut.renameTo(targetFile)
-            ScannerCache.invalidatePath(targetFile.absolutePath)
-            dbHelper.writableDatabase.update(
-                "pdf_files",
-                ContentValues().apply {
-                    put("size_bytes", sizeBytes)
-                    put("page_count", pageCount)
-                },
-                "id = ?",
-                arrayOf(sourcePdfId.toString())
-            )
-            refreshAll()
-            _pdfs.value.find { it.id == sourcePdfId }
-        }
     }
 
     suspend fun renamePdf(pdfId: Long, newTitle: String) = withContext(Dispatchers.IO) {

@@ -43,7 +43,6 @@ import androidx.compose.material.icons.filled.AddPhotoAlternate
 import androidx.compose.material.icons.filled.ArrowDownward
 import androidx.compose.material.icons.filled.ArrowUpward
 import androidx.compose.material.icons.filled.AutoFixHigh
-import androidx.compose.material.icons.filled.Brush
 import androidx.compose.material.icons.filled.CameraAlt
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.CheckBox
@@ -82,11 +81,9 @@ import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
-import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -112,8 +109,6 @@ import coil.compose.AsyncImage
 import coil.request.ImageRequest
 import coil.size.Size
 import com.example.R
-import com.example.engine.PdfEngine
-import com.example.model.DrawStroke
 import com.example.model.FilterMode
 import com.example.model.FolderModel
 import com.example.model.NormalizedPoint
@@ -124,8 +119,6 @@ import com.example.model.PdfPageSize
 import com.example.model.PdfQualityPreset
 import com.example.model.ScanDocumentModel
 import com.example.model.SignaturePlacement
-import com.example.ui.components.DirectSerialPickerDialog
-import com.example.ui.components.PageDrawDialog
 import com.example.ui.components.SignaturePadDialog
 import com.example.ui.theme.ObsidianBg
 import com.example.ui.theme.ObsidianBorder
@@ -134,8 +127,6 @@ import com.example.ui.theme.ObsidianSurfaceMid
 import com.example.ui.theme.TealAccent
 import com.example.ui.theme.TealContainer
 import com.example.ui.theme.TealOnContainer
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.withContext
 import java.io.File
 import java.util.Locale
 import kotlin.math.roundToInt
@@ -161,7 +152,6 @@ fun DocumentEditorScreen(
     onBatchDelete: (Set<Long>) -> Unit,
     onExtractOcr: (PageModel, (String) -> Unit) -> Unit,
     onStampSignature: (PageModel, List<List<NormalizedPoint>>, SignaturePlacement, Int) -> Unit,
-    onDrawOnPage: (PageModel, List<DrawStroke>) -> Unit,
     onSavePagePhoto: (PageModel, Int) -> Unit,
     onMovePage: (Int, Int) -> Unit,
     onReorderAllPages: (List<Long>) -> Unit,
@@ -198,7 +188,6 @@ fun DocumentEditorScreen(
     var exportSubsetOnly by remember { mutableStateOf(false) }
     var showAdjustPanel by remember { mutableStateOf(false) }
     var showSignatureDialog by remember { mutableStateOf(false) }
-    var showDrawDialog by remember { mutableStateOf(false) }
     var showReorderDialog by remember { mutableStateOf(false) }
     var ocrDialogText by remember { mutableStateOf<String?>(null) }
 
@@ -439,8 +428,6 @@ fun DocumentEditorScreen(
                     modifier = Modifier
                         .align(Alignment.TopEnd)
                         .padding(10.dp)
-                        .clip(RoundedCornerShape(10.dp))
-                        .clickable(enabled = document.pages.size > 1) { showReorderDialog = true }
                 ) {
                     Text(
                         text = if (zoomScale > 1.1f) "${safeIndex + 1}/${document.pages.size} · ${String.format(Locale.US, "%.1fx", zoomScale)}"
@@ -596,7 +583,6 @@ fun DocumentEditorScreen(
                         item { EditorActionIcon(Icons.Filled.Crop, "Crop") { onOpenCrop(activePage) } }
                         item { EditorActionIcon(Icons.AutoMirrored.Filled.RotateRight, "Rotate") { onQuickRotate(activePage) } }
                         item { EditorActionIcon(Icons.Filled.Tune, "Adjust", isActive = showAdjustPanel) { showAdjustPanel = !showAdjustPanel } }
-                        item { EditorActionIcon(Icons.Filled.Brush, "Draw") { showDrawDialog = true } }
                         item { EditorActionIcon(Icons.Filled.Draw, "Sign") { showSignatureDialog = true } }
                         item {
                             EditorActionIcon(Icons.Filled.TextSnippet, "OCR") {
@@ -608,7 +594,7 @@ fun DocumentEditorScreen(
                             }
                         }
                         if (document.pages.size > 1) {
-                            item { EditorActionIcon(Icons.Filled.SwapVert, "Serial") { showReorderDialog = true } }
+                            item { EditorActionIcon(Icons.Filled.SwapVert, "Reorder") { showReorderDialog = true } }
                         }
                         item { EditorActionIcon(Icons.Filled.ContentCopy, "Copy") { onDuplicatePage(activePage) } }
                         item { EditorActionIcon(Icons.Filled.SaveAlt, "Photo") { onSavePagePhoto(activePage, safeIndex + 1) } }
@@ -796,18 +782,6 @@ fun DocumentEditorScreen(
         )
     }
 
-    if (showDrawDialog && activePage != null) {
-        PageDrawDialog(
-            imagePath = activePage.enhancedImagePath,
-            pageLabel = "Page ${safeIndex + 1}",
-            onDismiss = { showDrawDialog = false },
-            onSave = { strokes ->
-                showDrawDialog = false
-                onDrawOnPage(activePage, strokes)
-            }
-        )
-    }
-
     ocrDialogText?.let { extracted ->
         AlertDialog(
             onDismissRequest = { ocrDialogText = null },
@@ -848,24 +822,13 @@ fun DocumentEditorScreen(
         val workingOrder = remember(document.pages) {
             mutableStateListOf<PageModel>().apply { addAll(document.pages) }
         }
-        var pickSerialForIdx by remember { mutableStateOf<Int?>(null) }
-
         AlertDialog(
             onDismissRequest = { showReorderDialog = false },
             containerColor = ObsidianSurface,
-            title = {
-                Column {
-                    Text("Page Serial Order")
-                    Text(
-                        text = "Tap any # badge to jump directly to a page number",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                }
-            },
+            title = { Text("Reorder Pages") },
             text = {
                 LazyColumn(
-                    modifier = Modifier.heightIn(max = 340.dp),
+                    modifier = Modifier.heightIn(max = 320.dp),
                     verticalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
                     itemsIndexed(workingOrder, key = { _, p -> p.id }) { idx, p ->
@@ -880,23 +843,6 @@ fun DocumentEditorScreen(
                                 modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
-                                Surface(
-                                    color = TealContainer,
-                                    shape = RoundedCornerShape(8.dp),
-                                    modifier = Modifier
-                                        .clip(RoundedCornerShape(8.dp))
-                                        .border(1.dp, TealAccent.copy(alpha = 0.65f), RoundedCornerShape(8.dp))
-                                        .clickable { pickSerialForIdx = idx }
-                                ) {
-                                    Text(
-                                        text = "#${idx + 1}",
-                                        style = MaterialTheme.typography.labelMedium,
-                                        fontWeight = FontWeight.Bold,
-                                        color = TealOnContainer,
-                                        modifier = Modifier.padding(horizontal = 9.dp, vertical = 6.dp)
-                                    )
-                                }
-                                Spacer(Modifier.width(10.dp))
                                 AsyncImage(
                                     model = File(p.bestThumbPath()),
                                     contentDescription = null,
@@ -905,15 +851,8 @@ fun DocumentEditorScreen(
                                         .size(width = 36.dp, height = 46.dp)
                                         .clip(RoundedCornerShape(6.dp))
                                 )
-                                Spacer(Modifier.width(10.dp))
-                                Column(modifier = Modifier.weight(1f)) {
-                                    Text("Page ${idx + 1}", style = MaterialTheme.typography.titleSmall)
-                                    Text(
-                                        text = "Tap #${idx + 1} to move",
-                                        style = MaterialTheme.typography.labelSmall,
-                                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                                    )
-                                }
+                                Spacer(Modifier.width(12.dp))
+                                Text("Page ${idx + 1}", style = MaterialTheme.typography.titleMedium, modifier = Modifier.weight(1f))
                                 IconButton(
                                     onClick = {
                                         if (idx > 0) {
@@ -951,22 +890,6 @@ fun DocumentEditorScreen(
                 TextButton(onClick = { showReorderDialog = false }) { Text("Cancel") }
             }
         )
-
-        pickSerialForIdx?.let { fromIdx ->
-            DirectSerialPickerDialog(
-                currentOneBasedIndex = fromIdx + 1,
-                totalCount = workingOrder.size,
-                onDismiss = { pickSerialForIdx = null },
-                onSelectTargetOneBasedIndex = { targetOneBased ->
-                    val toIdx = (targetOneBased - 1).coerceIn(0, workingOrder.lastIndex)
-                    if (fromIdx in workingOrder.indices && fromIdx != toIdx) {
-                        val moved = workingOrder.removeAt(fromIdx)
-                        workingOrder.add(toIdx, moved)
-                    }
-                    pickSerialForIdx = null
-                }
-            )
-        }
     }
 
     if (showRenameDialog) {
@@ -1040,10 +963,10 @@ fun DocumentEditorScreen(
 
     if (showExportSheet) {
         val subset = if (exportSubsetOnly && selectedPageIds.isNotEmpty()) selectedPageIds.toSet() else null
-        val targetPages = if (subset != null) document.pages.filter { subset.contains(it.id) } else document.pages
+        val targetCount = subset?.size ?: document.pages.size
         ExportPdfBottomSheet(
-            defaultTitle = if (subset != null) "${document.title} (${targetPages.size}p)" else document.title,
-            pagesToExport = targetPages,
+            defaultTitle = if (subset != null) "${document.title} (${targetCount}p)" else document.title,
+            pageCount = targetCount,
             onDismiss = { showExportSheet = false },
             onExport = { title, pageSize, quality, layout, margin, watermark, pageNums, password ->
                 showExportSheet = false
@@ -1095,7 +1018,7 @@ private fun EditorActionIcon(
 @Composable
 fun ExportPdfBottomSheet(
     defaultTitle: String,
-    pagesToExport: List<PageModel>,
+    pageCount: Int,
     onDismiss: () -> Unit,
     onExport: (
         title: String,
@@ -1118,18 +1041,6 @@ fun ExportPdfBottomSheet(
     var watermarkText by remember { mutableStateOf("CONFIDENTIAL") }
     var passwordEnabled by remember { mutableStateOf(false) }
     var password by remember { mutableStateOf("") }
-    var estimatedBytes by remember { mutableLongStateOf(0L) }
-
-    LaunchedEffect(pagesToExport, quality, pageLayout, watermarkEnabled, watermarkText) {
-        estimatedBytes = withContext(Dispatchers.IO) {
-            PdfEngine.estimateExportSizeBytes(
-                pages = pagesToExport.map { it.enhancedImagePath to it.filterMode },
-                qualityPreset = quality,
-                pageLayout = pageLayout,
-                watermarkText = if (watermarkEnabled) watermarkText.trim() else ""
-            )
-        }
-    }
 
     ModalBottomSheet(
         onDismissRequest = onDismiss,
@@ -1149,7 +1060,7 @@ fun ExportPdfBottomSheet(
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Text("Export PDF", style = MaterialTheme.typography.titleLarge)
-                Text("${pagesToExport.size} page(s)", style = MaterialTheme.typography.labelSmall, color = TealAccent)
+                Text("$pageCount page(s)", style = MaterialTheme.typography.labelSmall, color = TealAccent)
             }
 
             OutlinedTextField(
@@ -1333,42 +1244,6 @@ fun ExportPdfBottomSheet(
                                 .padding(bottom = 6.dp)
                         )
                     }
-                }
-            }
-
-            // Live Estimated Export Size Banner
-            Surface(
-                color = TealContainer.copy(alpha = 0.45f),
-                shape = RoundedCornerShape(12.dp),
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .border(1.dp, TealAccent.copy(alpha = 0.45f), RoundedCornerShape(12.dp))
-            ) {
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(horizontal = 14.dp, vertical = 10.dp),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Column {
-                        Text(
-                            text = "Estimated PDF Size",
-                            style = MaterialTheme.typography.labelMedium,
-                            color = MaterialTheme.colorScheme.onSurface
-                        )
-                        Text(
-                            text = "${quality.label} · ${pageSize.label} · ${pageLayout.label}",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-                    }
-                    Text(
-                        text = if (estimatedBytes > 0L) "~${PdfEngine.formatFileSize(estimatedBytes)}" else "Calculating…",
-                        style = MaterialTheme.typography.titleMedium,
-                        fontWeight = FontWeight.Bold,
-                        color = TealAccent
-                    )
                 }
             }
 
