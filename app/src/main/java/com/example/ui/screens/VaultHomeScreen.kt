@@ -36,15 +36,15 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.AddPhotoAlternate
+import androidx.compose.material.icons.filled.Build
 import androidx.compose.material.icons.filled.CameraAlt
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.DeleteOutline
 import androidx.compose.material.icons.filled.Description
+import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.Edit
-import androidx.compose.material.icons.filled.FileOpen
 import androidx.compose.material.icons.filled.Lock
-import androidx.compose.material.icons.filled.Merge
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.PictureAsPdf
 import androidx.compose.material.icons.filled.Search
@@ -83,6 +83,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import coil.compose.AsyncImage
 import coil.request.ImageRequest
+import coil.size.Size
 import com.example.R
 import com.example.engine.PdfEngine
 import com.example.model.PdfFileModel
@@ -112,13 +113,13 @@ fun VaultHomeScreen(
     onCreateFolder: (String) -> Unit,
     onStartCameraScan: () -> Unit,
     onPickGalleryImages: (List<Uri>) -> Unit,
-    onImportExternalPdf: (Uri) -> Unit,
-    onOpenMergePdfs: () -> Unit,
+    onOpenPdfTools: () -> Unit,
     onOpenDocument: (ScanDocumentModel) -> Unit,
     onRenameDocument: (Long, String) -> Unit,
     onDuplicateDocument: (Long) -> Unit,
     onDeleteDocument: (Long) -> Unit,
     onOpenPdf: (PdfFileModel) -> Unit,
+    onSavePdfToDownloads: (PdfFileModel) -> Unit,
     onRenamePdf: (Long, String) -> Unit,
     onDuplicatePdf: (Long) -> Unit,
     onDeletePdf: (Long) -> Unit
@@ -130,15 +131,9 @@ fun VaultHomeScreen(
     var renamePdfTarget by remember { mutableStateOf<PdfFileModel?>(null) }
 
     val galleryLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.PickMultipleVisualMedia(maxItems = 25)
+        contract = ActivityResultContracts.PickMultipleVisualMedia(maxItems = 40)
     ) { uris ->
         if (uris.isNotEmpty()) onPickGalleryImages(uris)
-    }
-
-    val pdfImportLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.OpenDocument()
-    ) { uri ->
-        if (uri != null) onImportExternalPdf(uri)
     }
 
     Box(
@@ -148,7 +143,7 @@ fun VaultHomeScreen(
             .statusBarsPadding()
     ) {
         Column(modifier = Modifier.fillMaxSize()) {
-            // Top Header: Clean "Naim" Branding
+            // Top Header: Clean "Naim" Branding + Tools + Search
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -174,27 +169,38 @@ fun VaultHomeScreen(
                     )
                 }
 
-                Row(horizontalArrangement = Arrangement.spacedBy(2.dp)) {
-                    IconButton(
-                        onClick = onOpenMergePdfs,
-                        modifier = Modifier.testTag("home_merge_pdfs_button")
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Surface(
+                        color = ObsidianSurface,
+                        shape = RoundedCornerShape(12.dp),
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(12.dp))
+                            .border(1.dp, ObsidianBorder, RoundedCornerShape(12.dp))
+                            .clickable(onClick = onOpenPdfTools)
+                            .testTag("home_pdf_tools_button")
                     ) {
-                        Icon(
-                            imageVector = Icons.Filled.Merge,
-                            contentDescription = stringResource(R.string.action_merge_pdfs),
-                            tint = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
+                        Row(
+                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Icon(
+                                imageVector = Icons.Filled.Build,
+                                contentDescription = "PDF Tools",
+                                tint = TealAccent,
+                                modifier = Modifier.size(16.dp)
+                            )
+                            Spacer(Modifier.width(6.dp))
+                            Text(
+                                text = "PDF Tools",
+                                style = MaterialTheme.typography.labelMedium,
+                                color = MaterialTheme.colorScheme.onSurface
+                            )
+                        }
                     }
-                    IconButton(
-                        onClick = { pdfImportLauncher.launch(arrayOf("application/pdf")) },
-                        modifier = Modifier.testTag("home_import_pdf_button")
-                    ) {
-                        Icon(
-                            imageVector = Icons.Filled.FileOpen,
-                            contentDescription = stringResource(R.string.action_import_pdf),
-                            tint = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-                    }
+
                     IconButton(
                         onClick = {
                             showSearch = !showSearch
@@ -382,6 +388,7 @@ fun VaultHomeScreen(
                                         pdf = pdf,
                                         onOpen = { onOpenPdf(pdf) },
                                         onShare = { ShareUtils.sharePdf(context, pdf.filePath, pdf.title) },
+                                        onSaveDownloads = { onSavePdfToDownloads(pdf) },
                                         onRename = { renamePdfTarget = pdf },
                                         onDuplicate = { onDuplicatePdf(pdf.id) },
                                         onDelete = { onDeletePdf(pdf.id) }
@@ -394,7 +401,7 @@ fun VaultHomeScreen(
             }
         }
 
-        // One-Handed Bottom Action Bar (anchored right for effortless thumb reach)
+        // One-Handed Bottom Action Bar
         Row(
             modifier = Modifier
                 .align(Alignment.BottomEnd)
@@ -619,7 +626,7 @@ private fun ScanDocumentCard(
     val context = LocalContext.current
     var menuExpanded by remember { mutableStateOf(false) }
     val firstPage = doc.pages.firstOrNull()
-    val thumbFile = firstPage?.let { File(it.enhancedImagePath) }
+    val thumbFile = firstPage?.let { File(it.bestThumbPath()) }
 
     Surface(
         color = ObsidianSurface,
@@ -641,6 +648,8 @@ private fun ScanDocumentCard(
                     AsyncImage(
                         model = ImageRequest.Builder(context)
                             .data(thumbFile)
+                            .size(Size(420, 540))
+                            .crossfade(true)
                             .memoryCacheKey("${thumbFile.absolutePath}_${thumbFile.lastModified()}")
                             .build(),
                         contentDescription = doc.title,
@@ -658,7 +667,6 @@ private fun ScanDocumentCard(
                     )
                 }
 
-                // Page count badge
                 Surface(
                     color = ObsidianBg.copy(alpha = 0.82f),
                     shape = RoundedCornerShape(8.dp),
@@ -750,6 +758,7 @@ private fun PdfVaultCard(
     pdf: PdfFileModel,
     onOpen: () -> Unit,
     onShare: () -> Unit,
+    onSaveDownloads: () -> Unit,
     onRename: () -> Unit,
     onDuplicate: () -> Unit,
     onDelete: () -> Unit
@@ -818,6 +827,14 @@ private fun PdfVaultCard(
                     expanded = menuExpanded,
                     onDismissRequest = { menuExpanded = false }
                 ) {
+                    DropdownMenuItem(
+                        text = { Text("Save to Downloads") },
+                        leadingIcon = { Icon(Icons.Filled.Download, contentDescription = null) },
+                        onClick = {
+                            menuExpanded = false
+                            onSaveDownloads()
+                        }
+                    )
                     DropdownMenuItem(
                         text = { Text(stringResource(R.string.action_rename)) },
                         leadingIcon = { Icon(Icons.Filled.Edit, contentDescription = null) },

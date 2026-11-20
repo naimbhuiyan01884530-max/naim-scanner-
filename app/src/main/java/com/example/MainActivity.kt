@@ -3,9 +3,16 @@ package com.example
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.SystemBarStyle
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
-import androidx.compose.foundation.background
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.slideInVertically
+import androidx.compose.animation.slideOutVertically
+import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -16,17 +23,20 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.OpenInNew
 import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.Share
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
@@ -43,15 +53,18 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
+import coil.Coil
 import com.example.engine.PdfEngine
+import com.example.engine.ScannerCache
+import com.example.model.PdfFileModel
 import com.example.ui.ScannerViewModel
 import com.example.ui.components.MergePdfsSheet
+import com.example.ui.components.PdfToolsSheet
 import com.example.ui.screens.CameraCaptureScreen
 import com.example.ui.screens.CropPerspectiveScreen
 import com.example.ui.screens.DocumentEditorScreen
@@ -59,6 +72,7 @@ import com.example.ui.screens.PdfViewerScreen
 import com.example.ui.screens.VaultHomeScreen
 import com.example.ui.theme.NaimScannerTheme
 import com.example.ui.theme.ObsidianBg
+import com.example.ui.theme.ObsidianBorder
 import com.example.ui.theme.ObsidianSurface
 import com.example.ui.theme.TealAccent
 import com.example.util.ShareUtils
@@ -77,6 +91,7 @@ private sealed interface AppScreen {
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        Coil.setImageLoader(ScannerCache.imageLoader(applicationContext))
         enableEdgeToEdge(
             statusBarStyle = SystemBarStyle.dark(ObsidianBg.toArgb()),
             navigationBarStyle = SystemBarStyle.dark(ObsidianBg.toArgb())
@@ -87,6 +102,13 @@ class MainActivity : ComponentActivity() {
             }
         }
     }
+
+    override fun onTrimMemory(level: Int) {
+        super.onTrimMemory(level)
+        if (level >= TRIM_MEMORY_MODERATE) {
+            ScannerCache.clear()
+        }
+    }
 }
 
 @Composable
@@ -95,7 +117,36 @@ fun NaimScannerApp(viewModel: ScannerViewModel = viewModel()) {
     val context = LocalContext.current
     var screen by remember { mutableStateOf<AppScreen>(AppScreen.Home) }
     var showMergeSheet by remember { mutableStateOf(false) }
+    var showToolsSheet by remember { mutableStateOf(false) }
+    var pendingSavePdf by remember { mutableStateOf<PdfFileModel?>(null) }
     val snackbarHostState = remember { SnackbarHostState() }
+
+    val pdfImportLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocument()
+    ) { uri ->
+        if (uri != null) viewModel.importExternalPdf(uri)
+    }
+
+    val createSafPdfLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.CreateDocument("application/pdf")
+    ) { destUri ->
+        val target = pendingSavePdf
+        pendingSavePdf = null
+        if (destUri != null && target != null) {
+            val ok = ShareUtils.copyPdfToUri(context, target.filePath, destUri)
+            viewModel.showMessage(if (ok) "PDF saved" else "Failed to save PDF")
+        }
+    }
+
+    fun triggerSaveToDownloads(pdf: PdfFileModel) {
+        val savedDirect = ShareUtils.savePdfToDownloads(context, pdf.filePath, pdf.title)
+        if (savedDirect) {
+            viewModel.showMessage("Saved to Downloads/NaimScanner")
+        } else {
+            pendingSavePdf = pdf
+            createSafPdfLauncher.launch("${pdf.title}.pdf")
+        }
+    }
 
     LaunchedEffect(uiState.statusMessage) {
         val msg = uiState.statusMessage
@@ -124,13 +175,13 @@ fun NaimScannerApp(viewModel: ScannerViewModel = viewModel()) {
                                 screen = AppScreen.DocumentEditor(docId)
                             }
                         },
-                        onImportExternalPdf = viewModel::importExternalPdf,
-                        onOpenMergePdfs = { showMergeSheet = true },
+                        onOpenPdfTools = { showToolsSheet = true },
                         onOpenDocument = { doc -> screen = AppScreen.DocumentEditor(doc.id) },
                         onRenameDocument = viewModel::renameDocument,
                         onDuplicateDocument = viewModel::duplicateDocument,
                         onDeleteDocument = viewModel::deleteDocument,
                         onOpenPdf = { pdf -> screen = AppScreen.PdfViewer(pdf.id) },
+                        onSavePdfToDownloads = ::triggerSaveToDownloads,
                         onRenamePdf = viewModel::renamePdf,
                         onDuplicatePdf = viewModel::duplicatePdf,
                         onDeletePdf = viewModel::deletePdf
@@ -188,20 +239,51 @@ fun NaimScannerApp(viewModel: ScannerViewModel = viewModel()) {
                                     currentCorners = page.corners,
                                     newRotation = (page.rotationDegrees + 90) % 360,
                                     flipH = page.flipHorizontal,
-                                    mode = page.filterMode
+                                    mode = page.filterMode,
+                                    contrast = page.contrastBoost,
+                                    brightness = page.brightnessOffset
                                 )
                             },
+                            onDuplicatePage = { page -> viewModel.duplicatePage(page.id) },
                             onRetakePage = { page ->
                                 screen = AppScreen.Camera(targetDocumentId = doc.id, retakePageId = page.id)
                             },
                             onDeletePage = { page -> viewModel.deletePage(page.id) },
-                            onApplyFilter = { page, mode -> viewModel.applyFilter(page.id, mode) },
+                            onApplyFilter = { page, mode, contrast, brightness ->
+                                viewModel.applyFilterAndAdjust(page.id, mode, contrast, brightness)
+                            },
                             onApplyFilterAll = { mode -> viewModel.applyFilterToAll(doc.id, mode) },
+                            onBatchApplyFilter = { pageIds, mode -> viewModel.batchApplyFilter(doc.id, pageIds, mode) },
+                            onBatchRotate = { pageIds -> viewModel.batchRotatePages(doc.id, pageIds) },
+                            onBatchAutoCrop = { pageIds -> viewModel.batchAutoCropPages(doc.id, pageIds) },
+                            onBatchDelete = { pageIds -> viewModel.batchDeletePages(doc.id, pageIds) },
+                            onExtractOcr = { page, onResult -> viewModel.extractOcrForPage(page.id, onResult) },
+                            onStampSignature = { page, strokes, placement, colorInt ->
+                                viewModel.stampSignatureOnPage(page.id, strokes, placement, colorInt)
+                            },
+                            onDrawOnPage = { page, strokes ->
+                                viewModel.drawStrokesOnPage(page.id, strokes)
+                            },
+                            onSavePagePhoto = { page, pageNum ->
+                                viewModel.savePageToGallery(page.enhancedImagePath, "${doc.title}_p$pageNum")
+                            },
                             onMovePage = { from, to -> viewModel.movePage(doc.id, from, to) },
+                            onReorderAllPages = { orderedIds -> viewModel.reorderAllPages(doc.id, orderedIds) },
                             onAddPageCamera = { screen = AppScreen.Camera(targetDocumentId = doc.id) },
                             onAddPagesGallery = { uris -> viewModel.addPagesFromGallery(doc.id, uris) },
-                            onExportPdf = { title, pageSize, quality, watermark, password ->
-                                viewModel.exportPdf(doc.id, title, pageSize, quality, watermark, password)
+                            onExportPdf = { title, pageSize, quality, layout, margin, watermark, pageNums, password, selectedPageIds ->
+                                viewModel.exportPdf(
+                                    documentId = doc.id,
+                                    title = title,
+                                    pageSize = pageSize,
+                                    qualityPreset = quality,
+                                    pageLayout = layout,
+                                    margin = margin,
+                                    watermarkText = watermark,
+                                    includePageNumbers = pageNums,
+                                    password = password,
+                                    selectedPageIds = selectedPageIds
+                                )
                             }
                         )
                     }
@@ -223,6 +305,8 @@ fun NaimScannerApp(viewModel: ScannerViewModel = viewModel()) {
                                     rotationDegrees = rot,
                                     flipHorizontal = flip,
                                     filterMode = page.filterMode,
+                                    contrastBoost = page.contrastBoost,
+                                    brightnessOffset = page.brightnessOffset,
                                     onDone = { screen = AppScreen.DocumentEditor(doc.id) }
                                 )
                             },
@@ -239,10 +323,18 @@ fun NaimScannerApp(viewModel: ScannerViewModel = viewModel()) {
                         PdfViewerScreen(
                             pdf = pdf,
                             onBack = { screen = AppScreen.Home },
-                            onExtractPages = { indices, title ->
-                                viewModel.splitExtractPdf(pdf.id, indices, title) { created ->
+                            onSaveToDownloads = { triggerSaveToDownloads(pdf) },
+                            onSaveOrderedOrSplitPages = { indices, title ->
+                                viewModel.splitOrReorderPdf(pdf.id, indices, title) { created ->
                                     if (created != null) {
                                         screen = AppScreen.PdfViewer(created.id)
+                                    }
+                                }
+                            },
+                            onAnnotatePdf = { annotationsMap, saveAsCopy ->
+                                viewModel.annotatePdf(pdf.id, annotationsMap, saveAsCopy) { updated ->
+                                    if (updated != null && updated.id != pdf.id) {
+                                        screen = AppScreen.PdfViewer(updated.id)
                                     }
                                 }
                             }
@@ -251,37 +343,69 @@ fun NaimScannerApp(viewModel: ScannerViewModel = viewModel()) {
                 }
             }
 
-            // Busy Processing Overlay
-            if (uiState.isBusy) {
-                Box(
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .background(Color.Black.copy(alpha = 0.65f)),
-                    contentAlignment = Alignment.Center
+            // Non-intrusive, non-blocking background progress indicator pill
+            AnimatedVisibility(
+                visible = uiState.isBusy,
+                enter = slideInVertically { -it } + fadeIn(),
+                exit = slideOutVertically { -it } + fadeOut(),
+                modifier = Modifier
+                    .align(Alignment.TopCenter)
+                    .statusBarsPadding()
+                    .padding(top = 10.dp, start = 20.dp, end = 20.dp)
+            ) {
+                Surface(
+                    color = ObsidianSurface.copy(alpha = 0.96f),
+                    shape = RoundedCornerShape(16.dp),
+                    shadowElevation = 8.dp,
+                    modifier = Modifier.border(1.dp, ObsidianBorder, RoundedCornerShape(16.dp))
                 ) {
-                    Surface(
-                        color = ObsidianSurface,
-                        shape = RoundedCornerShape(18.dp)
-                    ) {
-                        Row(
-                            modifier = Modifier.padding(horizontal = 24.dp, vertical = 18.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
+                    Column(modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp)) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
                             CircularProgressIndicator(
                                 color = TealAccent,
-                                modifier = Modifier.size(26.dp),
-                                strokeWidth = 3.dp
+                                modifier = Modifier.size(18.dp),
+                                strokeWidth = 2.5.dp
                             )
-                            Spacer(Modifier.width(14.dp))
+                            Spacer(Modifier.width(10.dp))
                             Text(
                                 text = uiState.busyMessage.ifEmpty { "Working…" },
-                                style = MaterialTheme.typography.titleMedium
+                                style = MaterialTheme.typography.labelLarge
+                            )
+                        }
+                        val progress = uiState.busyProgress
+                        if (progress != null) {
+                            Spacer(Modifier.height(6.dp))
+                            LinearProgressIndicator(
+                                progress = { progress.coerceIn(0f, 1f) },
+                                color = TealAccent,
+                                trackColor = ObsidianBg,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .height(3.dp)
                             )
                         }
                     }
                 }
             }
         }
+    }
+
+    if (showToolsSheet) {
+        PdfToolsSheet(
+            pdfs = uiState.pdfs,
+            onDismiss = { showToolsSheet = false },
+            onImportPdf = { pdfImportLauncher.launch(arrayOf("application/pdf")) },
+            onOpenMerge = { showMergeSheet = true },
+            onOpenPdfForSplit = { pdf -> screen = AppScreen.PdfViewer(pdf.id) },
+            onCompressPdf = { pdf, quality -> viewModel.compressPdf(pdf.id, quality) },
+            onProtectPdf = { pdf, pwd -> viewModel.protectPdf(pdf.id, pwd) },
+            onConvertPdfToScan = { pdf ->
+                viewModel.convertPdfToScan(pdf.id) { docId ->
+                    screen = AppScreen.DocumentEditor(docId)
+                }
+            },
+            onSavePdfAsImages = { pdf -> viewModel.savePdfImagesToGallery(pdf) }
+        )
     }
 
     if (showMergeSheet) {
@@ -295,7 +419,6 @@ fun NaimScannerApp(viewModel: ScannerViewModel = viewModel()) {
         )
     }
 
-    // Exported PDF Result Dialog showing EXACT PDF file size + Open & Share actions
     uiState.recentPdfResult?.let { exported ->
         AlertDialog(
             onDismissRequest = viewModel::clearRecentPdfResult,
@@ -308,10 +431,10 @@ fun NaimScannerApp(viewModel: ScannerViewModel = viewModel()) {
                 }
             },
             text = {
-                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     Text(exported.title, style = MaterialTheme.typography.titleMedium)
                     Text(
-                        text = "Size: ${PdfEngine.formatFileSize(exported.sizeBytes)} · ${exported.pageCount} page(s) · ${exported.pageSize.label}",
+                        text = "Size: ${PdfEngine.formatFileSize(exported.sizeBytes)} · ${exported.pageCount} page(s) · ${exported.qualityPreset.label}",
                         style = MaterialTheme.typography.labelSmall,
                         color = TealAccent
                     )
@@ -353,6 +476,17 @@ fun NaimScannerApp(viewModel: ScannerViewModel = viewModel()) {
                             Spacer(Modifier.width(4.dp))
                             Text("Share")
                         }
+                    }
+                    OutlinedButton(
+                        onClick = {
+                            viewModel.clearRecentPdfResult()
+                            triggerSaveToDownloads(exported)
+                        },
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Icon(Icons.Filled.Download, contentDescription = null, modifier = Modifier.size(16.dp))
+                        Spacer(Modifier.width(6.dp))
+                        Text("Save to Downloads")
                     }
                 }
             },

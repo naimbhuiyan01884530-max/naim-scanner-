@@ -4,26 +4,45 @@ import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Canvas
+import android.graphics.Color
 import android.graphics.Matrix
 import android.graphics.Paint
+import android.graphics.Path
 import android.media.ExifInterface
 import android.net.Uri
+import com.example.model.DrawStroke
 import com.example.model.FilterMode
 import com.example.model.NormalizedPoint
 import com.example.model.PdfQualityPreset
+import com.example.model.PhotoSharpness
 import com.example.model.QuadCorners
+import com.example.model.SignaturePlacement
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileOutputStream
+import java.nio.ByteBuffer
+import java.util.zip.Deflater
 import kotlin.math.abs
 import kotlin.math.hypot
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
 
+data class EncodedPdfStream(
+    val streamBytes: ByteArray,
+    val widthPx: Int,
+    val heightPx: Int,
+    val colorSpace: String,
+    val bitsPerComponent: Int,
+    val filterName: String
+)
+
 object ImageProcessor {
 
-    fun decodeUriNormalized(context: Context, uri: Uri, maxLongEdge: Int = 2200): Bitmap? {
+    const val MAX_CAPTURE_EDGE = 3600
+    const val THUMB_EDGE = 380
+
+    fun decodeUriNormalized(context: Context, uri: Uri, maxLongEdge: Int = MAX_CAPTURE_EDGE): Bitmap? {
         val orientation = context.contentResolver.openInputStream(uri)?.use { stream ->
             runCatching {
                 ExifInterface(stream).getAttributeInt(
@@ -51,7 +70,7 @@ object ImageProcessor {
         return applyExifOrientation(raw, orientation)
     }
 
-    fun decodeFileNormalized(path: String, maxLongEdge: Int = 2200): Bitmap? {
+    fun decodeFileNormalized(path: String, maxLongEdge: Int = MAX_CAPTURE_EDGE): Bitmap? {
         val file = File(path)
         if (!file.exists()) return null
 
@@ -73,6 +92,17 @@ object ImageProcessor {
         }
         val raw = BitmapFactory.decodeFile(path, opts) ?: return null
         return applyExifOrientation(raw, orientation)
+    }
+
+    /**
+     * Returns a cached preview Bitmap for instant cropper/viewer UI responsiveness.
+     * Callers must NOT recycle bitmaps returned by this method.
+     */
+    fun decodeFileCached(path: String, maxLongEdge: Int = 1600): Bitmap? {
+        ScannerCache.getBitmap(path, maxLongEdge)?.let { return it }
+        val decoded = decodeFileNormalized(path, maxLongEdge) ?: return null
+        ScannerCache.putBitmap(path, maxLongEdge, decoded)
+        return decoded
     }
 
     private fun applyExifOrientation(bitmap: Bitmap, orientation: Int): Bitmap {
@@ -120,16 +150,78 @@ object ImageProcessor {
         return inSampleSize
     }
 
-    fun saveBitmapJpeg(bitmap: Bitmap, outFile: File, quality: Int = 92) {
+    fun saveBitmapJpeg(bitmap: Bitmap, outFile: File, quality: Int = 94) {
         outFile.parentFile?.mkdirs()
         FileOutputStream(outFile).use { fos ->
             bitmap.compress(Bitmap.CompressFormat.JPEG, quality, fos)
         }
     }
 
+    fun saveThumbnail(source: Bitmap, outFile: File, maxEdge: Int = THUMB_EDGE) {
+        val longEdge = max(source.width, source.height).coerceAtLeast(1)
+        val scale = (maxEdge.toFloat() / longEdge).coerceAtMost(1f)
+        val tw = (source.width * scale).roundToInt().coerceAtLeast(1)
+        val th = (source.height * scale).roundToInt().coerceAtLeast(1)
+        val thumb = Bitmap.createBitmap(tw, th, Bitmap.Config.ARGB_8888)
+        val matrix = Matrix().apply { setScale(tw.toFloat() / source.width, th.toFloat() / source.height) }
+        Canvas(thumb).drawBitmap(source, matrix, Paint(Paint.FILTER_BITMAP_FLAG))
+        saveBitmapJpeg(thumb, outFile, 84)
+        thumb.recycle()
+    }
+
+    /**
+     * Real-time (<5ms) live camera Y-plane document boundary detector for viewfinder auto-crop overlay.
+     */
+    fun detectDocumentCornersFromLuma(
+        yBuffer: ByteBuffer,
+        rowStride: Int,
+        srcWidth: Int,
+        srcHeight: Int,
+        rotationDegrees: Int
+    ): QuadCorners? {
+        if (srcWidth < 64 || srcHeight < 64) return null
+        val stepX = max(1, srcWidth / 128)
+        val stepY = max(1, srcHeight / 96)
+        val w = srcWidth / stepX
+        val h = srcHeight / stepY
+        if (w < 24 || h < 24) return null
+
+        val lum = FloatArray(w * h)
+        val cap = yBuffer.capacity()
+        for (sy in 0 until h) {
+            val rowOff = sy * stepY * rowStride
+            for (sx in 0 until w) {
+                val idx = rowOff + sx * stepX
+                lum[sy * w + sx] = if (idx in 0 until cap) (yBuffer.get(idx).toInt() and 0xFF).toFloat() else 0f
+            }
+        }
+
+        val rawQuad = detectQuadOnLuminanceGrid(lum, w, h) ?: return null
+        return rotateQuadNormalized(rawQuad, rotationDegrees)
+    }
+
+    private fun rotateQuadNormalized(quad: QuadCorners, rotationDegrees: Int): QuadCorners {
+        fun rotPt(pt: NormalizedPoint): NormalizedPoint = when (((rotationDegrees % 360) + 360) % 360) {
+            90 -> NormalizedPoint(1f - pt.y, pt.x)
+            180 -> NormalizedPoint(1f - pt.x, 1f - pt.y)
+            270 -> NormalizedPoint(pt.y, 1f - pt.x)
+            else -> pt
+        }
+        val pts = listOf(
+            rotPt(quad.topLeft),
+            rotPt(quad.topRight),
+            rotPt(quad.bottomRight),
+            rotPt(quad.bottomLeft)
+        )
+        val tl = pts.minBy { it.x + it.y }
+        val br = pts.maxBy { it.x + it.y }
+        val tr = pts.maxBy { it.x - it.y }
+        val bl = pts.minBy { it.x - it.y }
+        return QuadCorners(tl, tr, br, bl)
+    }
+
     /**
      * Fast Sobel gradient + luminance contrast quad detector.
-     * Finds the outer document rectangle/trapezoid automatically on a compact proxy bitmap.
      */
     fun detectDocumentCorners(source: Bitmap): QuadCorners {
         val targetMax = 180
@@ -151,7 +243,10 @@ object ImageProcessor {
             lum[i] = 0.299f * r + 0.587f * g + 0.114f * b
         }
 
-        // Compute edge magnitude map using Sobel operator
+        return detectQuadOnLuminanceGrid(lum, w, h) ?: QuadCorners()
+    }
+
+    private fun detectQuadOnLuminanceGrid(lum: FloatArray, w: Int, h: Int): QuadCorners? {
         val edges = FloatArray(w * h)
         var maxEdge = 0f
         for (y in 1 until h - 1) {
@@ -170,9 +265,8 @@ object ImageProcessor {
             }
         }
 
-        if (maxEdge < 30f) return QuadCorners()
+        if (maxEdge < 32f) return null
 
-        // Find strong border pixels avoiding extreme 2% outer margin noise
         val threshold = maxEdge * 0.26f
         val marginX = (w * 0.02f).roundToInt().coerceAtLeast(2)
         val marginY = (h * 0.02f).roundToInt().coerceAtLeast(2)
@@ -224,14 +318,13 @@ object ImageProcessor {
             }
         }
 
-        if (strongCount < 20) return QuadCorners()
+        if (strongCount < 20) return null
 
         val areaWidth = max(trBestX - tlBestX, brBestX - blBestX).toFloat() / w
         val areaHeight = max(blBestY - tlBestY, brBestY - trBestY).toFloat() / h
 
-        // Sanity check: detected document should occupy a reasonable area
-        if (areaWidth < 0.25f || areaHeight < 0.25f) {
-            return QuadCorners()
+        if (areaWidth < 0.28f || areaHeight < 0.28f) {
+            return null
         }
 
         return QuadCorners(
@@ -243,7 +336,7 @@ object ImageProcessor {
     }
 
     /**
-     * Performs 4-corner perspective dewarp + orientation transform.
+     * Performs high-resolution 4-corner perspective dewarp + orientation transform.
      */
     fun warpAndOrient(
         source: Bitmap,
@@ -260,8 +353,8 @@ object ImageProcessor {
         val leftH = hypot((srcPts[6] - srcPts[0]).toDouble(), (srcPts[7] - srcPts[1]).toDouble())
         val rightH = hypot((srcPts[4] - srcPts[2]).toDouble(), (srcPts[5] - srcPts[3]).toDouble())
 
-        val dstW = ((topW + botW) / 2.0).roundToInt().coerceIn(64, 2600)
-        val dstH = ((leftH + rightH) / 2.0).roundToInt().coerceIn(64, 3400)
+        val dstW = ((topW + botW) / 2.0).roundToInt().coerceIn(64, 3800)
+        val dstH = ((leftH + rightH) / 2.0).roundToInt().coerceIn(64, 4200)
 
         val dstPts = floatArrayOf(
             0f, 0f,
@@ -301,7 +394,8 @@ object ImageProcessor {
     }
 
     /**
-     * Applies high-clarity document enhancement with local illumination shadow removal & edge sharpening.
+     * High-clarity document enhancement with fine local illumination normalization,
+     * adaptive thresholding, and edge-preserving text sharpening.
      */
     fun applyEnhancement(
         source: Bitmap,
@@ -318,27 +412,36 @@ object ImageProcessor {
         val pixels = IntArray(w * h)
         source.getPixels(pixels, 0, w, 0, 0, w, h)
 
-        if (mode == FilterMode.ORIGINAL) {
+        if (mode == FilterMode.ORIGINAL || mode == FilterMode.GRAYSCALE) {
             val out = IntArray(pixels.size)
             for (i in pixels.indices) {
                 val c = pixels[i]
-                val r = (((((c shr 16) and 0xFF) - 128f) * contrastBoost + 128f) + brightnessOffset).roundToInt().coerceIn(0, 255)
-                val g = (((((c shr 8) and 0xFF) - 128f) * contrastBoost + 128f) + brightnessOffset).roundToInt().coerceIn(0, 255)
-                val b = ((((c and 0xFF) - 128f) * contrastBoost + 128f) + brightnessOffset).roundToInt().coerceIn(0, 255)
-                out[i] = (0xFF shl 24) or (r shl 16) or (g shl 8) or b
+                val r = (c shr 16) and 0xFF
+                val g = (c shr 8) and 0xFF
+                val b = c and 0xFF
+                if (mode == FilterMode.GRAYSCALE) {
+                    val gray = 0.299f * r + 0.587f * g + 0.114f * b
+                    val adj = (((gray - 128f) * (1.15f * contrastBoost) + 132f) + brightnessOffset)
+                        .roundToInt().coerceIn(0, 255)
+                    out[i] = (0xFF shl 24) or (adj shl 16) or (adj shl 8) or adj
+                } else {
+                    val ir = (((r - 128f) * contrastBoost + 128f) + brightnessOffset).roundToInt().coerceIn(0, 255)
+                    val ig = (((g - 128f) * contrastBoost + 128f) + brightnessOffset).roundToInt().coerceIn(0, 255)
+                    val ib = (((b - 128f) * contrastBoost + 128f) + brightnessOffset).roundToInt().coerceIn(0, 255)
+                    out[i] = (0xFF shl 24) or (ir shl 16) or (ig shl 8) or ib
+                }
             }
             return Bitmap.createBitmap(out, w, h, Bitmap.Config.ARGB_8888)
         }
 
-        // Downsampled illumination background map (removes shadows and uneven desk lighting)
-        val bgW = (w / 16).coerceIn(16, 120)
-        val bgH = (h / 16).coerceIn(16, 120)
+        // Fine local illumination background map for shadow removal without haloes
+        val bgW = (w / 22).coerceIn(16, 160)
+        val bgH = (h / 22).coerceIn(16, 160)
         val bgBmp = Bitmap.createScaledBitmap(source, bgW, bgH, true)
         val bgRaw = IntArray(bgW * bgH)
         bgBmp.getPixels(bgRaw, 0, bgW, 0, 0, bgW, bgH)
         bgBmp.recycle()
 
-        // Local maximum-ish illumination smoothing on downsampled map (3x3 dilation + average)
         val bgLum = FloatArray(bgW * bgH)
         for (i in bgRaw.indices) {
             val c = bgRaw[i]
@@ -363,8 +466,7 @@ object ImageProcessor {
                         cnt++
                     }
                 }
-                // Blend local bright paper estimate and smooth average so dark ink isn't washed out
-                smoothBg[y * bgW + x] = (maxNear * 0.65f + (sumNear / cnt) * 0.35f).coerceAtLeast(36f)
+                smoothBg[y * bgW + x] = (maxNear * 0.70f + (sumNear / cnt) * 0.30f).coerceAtLeast(36f)
             }
         }
 
@@ -387,48 +489,49 @@ object ImageProcessor {
                 when (mode) {
                     FilterMode.SHARP_BW -> {
                         val norm = (lum * 255f / bgEstimate) + brightnessOffset
-                        // Crisp document S-curve pushing background >= 188 to pure 255 and ink <= 125 deep black
-                        val centered = (norm - 155f) * (2.6f * contrastBoost) + 155f
+                        val centered = (norm - 166f) * (3.15f * contrastBoost) + 166f
                         val clamped = centered.coerceIn(0f, 255f)
-                        val clean = if (clamped > 218f) 255f else if (clamped < 48f) clamped * 0.45f else clamped
+                        val clean = when {
+                            clamped > 208f -> 255f
+                            clamped < 64f -> 0f
+                            else -> clamped * 0.65f
+                        }
                         outLum[idx] = clean
                     }
                     FilterMode.CLEAN_GRAY -> {
-                        val norm = (lum * 248f / bgEstimate) + brightnessOffset
-                        val centered = (norm - 140f) * (1.45f * contrastBoost) + 145f
-                        val clean = if (centered > 235f) 255f else centered.coerceIn(0f, 255f)
+                        val norm = (lum * 252f / bgEstimate) + brightnessOffset
+                        val centered = (norm - 142f) * (1.62f * contrastBoost) + 148f
+                        val clean = if (centered > 230f) 255f else centered.coerceIn(0f, 255f)
                         outLum[idx] = clean
                     }
                     FilterMode.COLOR_BOOST -> {
-                        val gain = (244f / bgEstimate).coerceIn(1.0f, 2.15f)
+                        val gain = (248f / bgEstimate).coerceIn(1.0f, 2.25f)
                         var nr = r * gain + brightnessOffset
                         var ng = g * gain + brightnessOffset
                         var nb = b * gain + brightnessOffset
 
-                        // Vibrance / contrast around midpoint
                         val avg = (nr + ng + nb) / 3f
-                        val sat = 1.24f
+                        val sat = 1.28f
                         nr = avg + (nr - avg) * sat
                         ng = avg + (ng - avg) * sat
                         nb = avg + (nb - avg) * sat
 
-                        nr = (nr - 128f) * (1.15f * contrastBoost) + 128f
-                        ng = (ng - 128f) * (1.15f * contrastBoost) + 128f
-                        nb = (nb - 128f) * (1.15f * contrastBoost) + 128f
+                        nr = (nr - 128f) * (1.20f * contrastBoost) + 128f
+                        ng = (ng - 128f) * (1.20f * contrastBoost) + 128f
+                        nb = (nb - 128f) * (1.20f * contrastBoost) + 128f
 
                         val ir = nr.roundToInt().coerceIn(0, 255)
                         val ig = ng.roundToInt().coerceIn(0, 255)
                         val ib = nb.roundToInt().coerceIn(0, 255)
                         outPixels[idx] = (0xFF shl 24) or (ir shl 16) or (ig shl 8) or ib
                     }
-                    FilterMode.ORIGINAL -> Unit
+                    FilterMode.GRAYSCALE, FilterMode.ORIGINAL -> Unit
                 }
             }
         }
 
         if (mode == FilterMode.SHARP_BW || mode == FilterMode.CLEAN_GRAY) {
-            // Fast 3x3 unsharp mask to keep small text crisp when zoomed in
-            val amount = if (mode == FilterMode.SHARP_BW) 0.55f else 0.35f
+            val amount = if (mode == FilterMode.SHARP_BW) 0.78f else 0.50f
             for (y in 0 until h) {
                 val row = y * w
                 for (x in 0 until w) {
@@ -440,7 +543,7 @@ object ImageProcessor {
                                 outLum[idx - w] + outLum[idx + w]
                             ) * 0.25f
                         val v = center + (center - neighbors) * amount
-                        if (mode == FilterMode.SHARP_BW && v > 230f) 255 else v.roundToInt().coerceIn(0, 255)
+                        if (mode == FilterMode.SHARP_BW && v > 220f) 255 else v.roundToInt().coerceIn(0, 255)
                     } else {
                         center.roundToInt().coerceIn(0, 255)
                     }
@@ -452,29 +555,289 @@ object ImageProcessor {
         return Bitmap.createBitmap(outPixels, w, h, Bitmap.Config.ARGB_8888)
     }
 
+    fun stampSignatureOnBitmap(
+        source: Bitmap,
+        strokes: List<List<NormalizedPoint>>,
+        placement: SignaturePlacement,
+        inkColorInt: Int
+    ): Bitmap {
+        val copy = source.copy(Bitmap.Config.ARGB_8888, true)
+        if (strokes.isEmpty()) return copy
+        val canvas = Canvas(copy)
+
+        val boxW = copy.width * 0.34f
+        val boxH = copy.height * 0.14f
+        val marginX = copy.width * 0.06f
+        val marginY = copy.height * 0.06f
+        val left = when (placement) {
+            SignaturePlacement.BOTTOM_LEFT -> marginX
+            SignaturePlacement.BOTTOM_CENTER -> (copy.width - boxW) / 2f
+            SignaturePlacement.BOTTOM_RIGHT -> copy.width - boxW - marginX
+        }
+        val top = copy.height - boxH - marginY
+
+        val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = inkColorInt
+            style = Paint.Style.STROKE
+            strokeCap = Paint.Cap.ROUND
+            strokeJoin = Paint.Join.ROUND
+            strokeWidth = (min(copy.width, copy.height) * 0.0055f).coerceIn(3.5f, 14f)
+        }
+
+        for (stroke in strokes) {
+            if (stroke.size < 2) continue
+            val path = Path()
+            path.moveTo(left + stroke[0].x * boxW, top + stroke[0].y * boxH)
+            for (i in 1 until stroke.size) {
+                path.lineTo(left + stroke[i].x * boxW, top + stroke[i].y * boxH)
+            }
+            canvas.drawPath(path, paint)
+        }
+        return copy
+    }
+
+    /**
+     * Stamps multi-color freehand pen and highlighter strokes onto a full page or PDF bitmap.
+     */
+    fun drawStrokesOnBitmap(
+        source: Bitmap,
+        strokes: List<DrawStroke>
+    ): Bitmap {
+        val copy = source.copy(Bitmap.Config.ARGB_8888, true)
+        if (strokes.isEmpty()) return copy
+        val canvas = Canvas(copy)
+        val w = copy.width.toFloat()
+        val h = copy.height.toFloat()
+        val minDim = min(w, h)
+
+        for (stroke in strokes) {
+            if (stroke.points.isEmpty()) continue
+            val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                val baseColor = stroke.colorArgb
+                color = if (stroke.isHighlighter) {
+                    Color.argb(96, Color.red(baseColor), Color.green(baseColor), Color.blue(baseColor))
+                } else {
+                    baseColor
+                }
+                style = Paint.Style.STROKE
+                strokeCap = Paint.Cap.ROUND
+                strokeJoin = Paint.Join.ROUND
+                val mult = if (stroke.isHighlighter) 2.6f else 1f
+                strokeWidth = (minDim * stroke.strokeWidthFraction * mult).coerceIn(3f, 84f)
+            }
+            if (stroke.points.size == 1) {
+                val pt = stroke.points[0]
+                paint.style = Paint.Style.FILL
+                canvas.drawCircle(pt.x * w, pt.y * h, paint.strokeWidth * 0.5f, paint)
+            } else {
+                val path = Path()
+                path.moveTo(stroke.points[0].x * w, stroke.points[0].y * h)
+                for (i in 1 until stroke.points.size) {
+                    path.lineTo(stroke.points[i].x * w, stroke.points[i].y * h)
+                }
+                canvas.drawPath(path, paint)
+            }
+        }
+        return copy
+    }
+
+    /**
+     * Fast offline Laplacian sharpness check on center 70% region to flag blurry batch captures.
+     */
+    fun estimatePhotoSharpness(filePath: String): PhotoSharpness {
+        val sample = decodeFileNormalized(filePath, 260) ?: return PhotoSharpness.SOFT
+        val w = sample.width
+        val h = sample.height
+        if (w < 24 || h < 24) {
+            sample.recycle()
+            return PhotoSharpness.SOFT
+        }
+        val pixels = IntArray(w * h)
+        sample.getPixels(pixels, 0, w, 0, 0, w, h)
+        sample.recycle()
+
+        val lum = FloatArray(w * h)
+        for (i in pixels.indices) {
+            val c = pixels[i]
+            val r = (c shr 16) and 0xFF
+            val g = (c shr 8) and 0xFF
+            val b = c and 0xFF
+            lum[i] = 0.299f * r + 0.587f * g + 0.114f * b
+        }
+
+        val x0 = (w * 0.15f).roundToInt().coerceAtLeast(1)
+        val x1 = (w * 0.85f).roundToInt().coerceAtMost(w - 2)
+        val y0 = (h * 0.15f).roundToInt().coerceAtLeast(1)
+        val y1 = (h * 0.85f).roundToInt().coerceAtMost(h - 2)
+
+        var sum = 0.0
+        var sumSq = 0.0
+        var count = 0
+        for (y in y0..y1) {
+            val row = y * w
+            for (x in x0..x1) {
+                val idx = row + x
+                val lap = 4.0 * lum[idx] - lum[idx - 1] - lum[idx + 1] - lum[idx - w] - lum[idx + w]
+                sum += lap
+                sumSq += lap * lap
+                count++
+            }
+        }
+        if (count == 0) return PhotoSharpness.SOFT
+        val mean = sum / count
+        val variance = (sumSq / count) - (mean * mean)
+        return when {
+            variance < 95.0 -> PhotoSharpness.BLURRY
+            variance < 240.0 -> PhotoSharpness.SOFT
+            else -> PhotoSharpness.SHARP
+        }
+    }
+
+    fun composeTwoUpPage(topBmp: Bitmap, bottomBmp: Bitmap?, targetLongEdge: Int): Bitmap {
+        val outW = (targetLongEdge * 0.707f).roundToInt().coerceAtLeast(800)
+        val outH = targetLongEdge.coerceAtLeast(1130)
+        val page = Bitmap.createBitmap(outW, outH, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(page)
+        canvas.drawColor(Color.WHITE)
+
+        val pad = outW * 0.06f
+        val slotW = outW - pad * 2f
+        val slotH = (outH - pad * 3f) / 2f
+
+        fun drawFit(bmp: Bitmap, slotTop: Float) {
+            val scale = min(slotW / bmp.width, slotH / bmp.height)
+            val dw = bmp.width * scale
+            val dh = bmp.height * scale
+            val dx = (outW - dw) / 2f
+            val dy = slotTop + (slotH - dh) / 2f
+            val m = Matrix().apply {
+                postScale(scale, scale)
+                postTranslate(dx, dy)
+            }
+            canvas.drawBitmap(bmp, m, Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG))
+        }
+
+        drawFit(topBmp, pad)
+        if (bottomBmp != null) {
+            drawFit(bottomBmp, pad * 2f + slotH)
+        }
+        return page
+    }
+
+    /**
+     * Hybrid smart PDF stream encoder:
+     * - For high-resolution SHARP_BW scans with pure monochrome ink, emits lossless 1-bit FlateDecode
+     *   (/DeviceGray /BitsPerComponent 1 /Filter /FlateDecode) for zero pixelation at extreme zoom
+     *   and tiny file size.
+     * - For photos, shaded grayscale, or colored ink/watermarks, emits crisp adaptive DCTDecode JPEG.
+     */
+    fun encodePageForPdf(
+        source: Bitmap,
+        filterMode: FilterMode,
+        qualityPreset: PdfQualityPreset,
+        watermarkText: String = "",
+        pageNumberLabel: String = ""
+    ): EncodedPdfStream {
+        val longEdge = max(source.width, source.height)
+        val scaled = if (longEdge > qualityPreset.maxLongEdgePx) {
+            val factor = qualityPreset.maxLongEdgePx.toFloat() / longEdge
+            val tw = (source.width * factor).roundToInt().coerceAtLeast(1)
+            val th = (source.height * factor).roundToInt().coerceAtLeast(1)
+            val resized = Bitmap.createBitmap(tw, th, Bitmap.Config.ARGB_8888)
+            val m = Matrix().apply { setScale(tw.toFloat() / source.width, th.toFloat() / source.height) }
+            Canvas(resized).drawBitmap(source, m, Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG))
+            resized
+        } else {
+            source
+        }
+
+        val needsOverlay = watermarkText.isNotBlank() || pageNumberLabel.isNotBlank()
+        val finalBitmap = if (needsOverlay) {
+            val copy = scaled.copy(Bitmap.Config.ARGB_8888, true)
+            if (watermarkText.isNotBlank()) drawWatermarkOnCanvas(copy, watermarkText.trim())
+            if (pageNumberLabel.isNotBlank()) drawPageNumberOnCanvas(copy, pageNumberLabel)
+            copy
+        } else {
+            scaled
+        }
+
+        val w = finalBitmap.width
+        val h = finalBitmap.height
+
+        // Use lossless 1-bit FlateDecode when SHARP_BW, high enough DPI (>= 2480), no colored watermark,
+        // and no colored signature stamped on page.
+        val useMonochromeFlate = filterMode == FilterMode.SHARP_BW &&
+            watermarkText.isBlank() &&
+            qualityPreset.maxLongEdgePx >= 2480 &&
+            isMonochromeBitmap(finalBitmap)
+
+        if (useMonochromeFlate) {
+            val flateBytes = encode1BitFlate(finalBitmap)
+            if (finalBitmap !== scaled && finalBitmap !== source) finalBitmap.recycle()
+            if (scaled !== source) scaled.recycle()
+            return EncodedPdfStream(
+                streamBytes = flateBytes,
+                widthPx = w,
+                heightPx = h,
+                colorSpace = "/DeviceGray",
+                bitsPerComponent = 1,
+                filterName = "/FlateDecode"
+            )
+        }
+
+        val jpegQuality = if (filterMode == FilterMode.SHARP_BW || filterMode == FilterMode.GRAYSCALE) {
+            qualityPreset.bwJpegQuality
+        } else {
+            qualityPreset.jpegQuality
+        }
+
+        val baos = ByteArrayOutputStream()
+        finalBitmap.compress(Bitmap.CompressFormat.JPEG, jpegQuality, baos)
+
+        if (finalBitmap !== scaled && finalBitmap !== source) finalBitmap.recycle()
+        if (scaled !== source) scaled.recycle()
+
+        return EncodedPdfStream(
+            streamBytes = baos.toByteArray(),
+            widthPx = w,
+            heightPx = h,
+            colorSpace = "/DeviceRGB",
+            bitsPerComponent = 8,
+            filterName = "/DCTDecode"
+        )
+    }
+
     fun encodeJpegForPdf(
         source: Bitmap,
         filterMode: FilterMode,
         qualityPreset: PdfQualityPreset,
-        watermarkText: String = ""
+        watermarkText: String = "",
+        pageNumberLabel: String = ""
     ): ByteArray {
         val longEdge = max(source.width, source.height)
         val scaled = if (longEdge > qualityPreset.maxLongEdgePx) {
             val factor = qualityPreset.maxLongEdgePx.toFloat() / longEdge
             val tw = (source.width * factor).roundToInt().coerceAtLeast(1)
             val th = (source.height * factor).roundToInt().coerceAtLeast(1)
-            Bitmap.createScaledBitmap(source, tw, th, true)
+            val resized = Bitmap.createBitmap(tw, th, Bitmap.Config.ARGB_8888)
+            val m = Matrix().apply { setScale(tw.toFloat() / source.width, th.toFloat() / source.height) }
+            Canvas(resized).drawBitmap(source, m, Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG))
+            resized
         } else {
             source
         }
 
-        val finalBitmap = if (watermarkText.isNotBlank()) {
-            drawWatermarkOnBitmap(scaled, watermarkText.trim())
+        val needsOverlay = watermarkText.isNotBlank() || pageNumberLabel.isNotBlank()
+        val finalBitmap = if (needsOverlay) {
+            val copy = scaled.copy(Bitmap.Config.ARGB_8888, true)
+            if (watermarkText.isNotBlank()) drawWatermarkOnCanvas(copy, watermarkText.trim())
+            if (pageNumberLabel.isNotBlank()) drawPageNumberOnCanvas(copy, pageNumberLabel)
+            copy
         } else {
             scaled
         }
 
-        val jpegQuality = if (filterMode == FilterMode.SHARP_BW) {
+        val jpegQuality = if (filterMode == FilterMode.SHARP_BW || filterMode == FilterMode.GRAYSCALE) {
             qualityPreset.bwJpegQuality
         } else {
             qualityPreset.jpegQuality
@@ -489,21 +852,98 @@ object ImageProcessor {
         return baos.toByteArray()
     }
 
-    private fun drawWatermarkOnBitmap(source: Bitmap, text: String): Bitmap {
-        val copy = source.copy(Bitmap.Config.ARGB_8888, true)
-        val canvas = Canvas(copy)
-        val textSize = (min(copy.width, copy.height) * 0.055f).coerceIn(22f, 96f)
+    private fun isMonochromeBitmap(bitmap: Bitmap): Boolean {
+        val w = bitmap.width
+        val h = bitmap.height
+        val pixels = IntArray(w * h)
+        bitmap.getPixels(pixels, 0, w, 0, 0, w, h)
+        val step = max(1, pixels.size / 12000)
+        var i = 0
+        while (i < pixels.size) {
+            val c = pixels[i]
+            val r = (c shr 16) and 0xFF
+            val g = (c shr 8) and 0xFF
+            val b = c and 0xFF
+            if (abs(r - g) > 14 || abs(g - b) > 14 || abs(r - b) > 14) {
+                return false
+            }
+            i += step
+        }
+        return true
+    }
+
+    private fun encode1BitFlate(bitmap: Bitmap): ByteArray {
+        val w = bitmap.width
+        val h = bitmap.height
+        val rowBytes = (w + 7) / 8
+        val packed = ByteArray(rowBytes * h)
+        val rowPixels = IntArray(w)
+
+        for (y in 0 until h) {
+            bitmap.getPixels(rowPixels, 0, w, 0, y, w, 1)
+            val rowOutOffset = y * rowBytes
+            var byteAcc = 0
+            var bitCount = 0
+            var byteIdx = 0
+            for (x in 0 until w) {
+                val c = rowPixels[x]
+                val r = (c shr 16) and 0xFF
+                val g = (c shr 8) and 0xFF
+                val b = c and 0xFF
+                val lum = (r * 3 + g * 6 + b) / 10
+                val bit = if (lum >= 172) 1 else 0
+                byteAcc = (byteAcc shl 1) or bit
+                bitCount++
+                if (bitCount == 8) {
+                    packed[rowOutOffset + byteIdx] = byteAcc.toByte()
+                    byteIdx++
+                    byteAcc = 0
+                    bitCount = 0
+                }
+            }
+            if (bitCount > 0) {
+                byteAcc = byteAcc shl (8 - bitCount)
+                packed[rowOutOffset + byteIdx] = byteAcc.toByte()
+            }
+        }
+
+        val deflater = Deflater(Deflater.BEST_COMPRESSION)
+        deflater.setInput(packed)
+        deflater.finish()
+        val out = ByteArrayOutputStream(packed.size / 6 + 64)
+        val buf = ByteArray(8192)
+        while (!deflater.finished()) {
+            val count = deflater.deflate(buf)
+            if (count > 0) out.write(buf, 0, count)
+        }
+        deflater.end()
+        return out.toByteArray()
+    }
+
+    private fun drawWatermarkOnCanvas(target: Bitmap, text: String) {
+        val canvas = Canvas(target)
+        val textSize = (min(target.width, target.height) * 0.055f).coerceIn(22f, 120f)
         val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = android.graphics.Color.argb(46, 20, 184, 166)
+            color = Color.argb(46, 20, 184, 166)
             this.textSize = textSize
             textAlign = Paint.Align.CENTER
             isFakeBoldText = true
         }
         canvas.save()
-        canvas.translate(copy.width / 2f, copy.height / 2f)
+        canvas.translate(target.width / 2f, target.height / 2f)
         canvas.rotate(-32f)
         canvas.drawText(text, 0f, textSize * 0.35f, paint)
         canvas.restore()
-        return copy
+    }
+
+    private fun drawPageNumberOnCanvas(target: Bitmap, label: String) {
+        val canvas = Canvas(target)
+        val textSize = (min(target.width, target.height) * 0.022f).coerceIn(18f, 44f)
+        val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.argb(175, 70, 80, 95)
+            this.textSize = textSize
+            textAlign = Paint.Align.CENTER
+        }
+        canvas.drawText(label, target.width / 2f, target.height - textSize * 1.1f, paint)
     }
 }

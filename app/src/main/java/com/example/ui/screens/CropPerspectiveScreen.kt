@@ -99,7 +99,7 @@ fun CropPerspectiveScreen(
 
     LaunchedEffect(page.rawImagePath) {
         val loaded = withContext(Dispatchers.IO) {
-            ImageProcessor.decodeFileNormalized(page.rawImagePath, 1600)
+            ImageProcessor.decodeFileCached(page.rawImagePath, 1600)
         }
         rawBitmap = loaded
         imageBitmap = loaded?.asImageBitmap()

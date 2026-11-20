@@ -48,12 +48,14 @@ class ScannerDatabaseHelper(context: Context) : SQLiteOpenHelper(
                 raw_image_path TEXT NOT NULL,
                 cropped_image_path TEXT NOT NULL,
                 enhanced_image_path TEXT NOT NULL,
+                thumb_image_path TEXT NOT NULL DEFAULT '',
                 corners_serialized TEXT NOT NULL,
                 rotation_degrees INTEGER NOT NULL DEFAULT 0,
                 flip_horizontal INTEGER NOT NULL DEFAULT 0,
                 filter_mode TEXT NOT NULL DEFAULT 'SHARP_BW',
                 contrast_boost REAL NOT NULL DEFAULT 1.0,
-                brightness_offset REAL NOT NULL DEFAULT 0.0
+                brightness_offset REAL NOT NULL DEFAULT 0.0,
+                ocr_text TEXT NOT NULL DEFAULT ''
             )
             """.trimIndent()
         )
@@ -86,15 +88,20 @@ class ScannerDatabaseHelper(context: Context) : SQLiteOpenHelper(
     }
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
-        db.execSQL("DROP TABLE IF EXISTS pdf_files")
-        db.execSQL("DROP TABLE IF EXISTS pages")
-        db.execSQL("DROP TABLE IF EXISTS documents")
-        db.execSQL("DROP TABLE IF EXISTS folders")
-        onCreate(db)
+        if (oldVersion < 2) {
+            runCatching {
+                db.execSQL("ALTER TABLE pages ADD COLUMN thumb_image_path TEXT NOT NULL DEFAULT ''")
+            }
+        }
+        if (oldVersion < 3) {
+            runCatching {
+                db.execSQL("ALTER TABLE pages ADD COLUMN ocr_text TEXT NOT NULL DEFAULT ''")
+            }
+        }
     }
 
     companion object {
         private const val DATABASE_NAME = "naim_scanner.db"
-        private const val DATABASE_VERSION = 1
+        private const val DATABASE_VERSION = 3
     }
 }

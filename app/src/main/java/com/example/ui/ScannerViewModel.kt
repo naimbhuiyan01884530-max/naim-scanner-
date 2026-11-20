@@ -6,13 +6,20 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.data.ScannerRepository
 import com.example.engine.ImageProcessor
+import com.example.engine.PdfEngine
+import com.example.model.DrawStroke
 import com.example.model.FilterMode
 import com.example.model.FolderModel
+import com.example.model.NormalizedPoint
 import com.example.model.PdfFileModel
+import com.example.model.PdfMargin
+import com.example.model.PdfPageLayout
 import com.example.model.PdfPageSize
 import com.example.model.PdfQualityPreset
 import com.example.model.QuadCorners
 import com.example.model.ScanDocumentModel
+import com.example.model.SignaturePlacement
+import com.example.util.ShareUtils
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
@@ -34,6 +41,7 @@ data class ScannerUiState(
     val pdfs: List<PdfFileModel> = emptyList(),
     val isBusy: Boolean = false,
     val busyMessage: String = "",
+    val busyProgress: Float? = null,
     val recentPdfResult: PdfFileModel? = null,
     val statusMessage: String? = null
 )
@@ -45,7 +53,7 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
     private val activeTab = MutableStateFlow(VaultTab.SCANS)
     private val searchQuery = MutableStateFlow("")
     private val selectedFolderId = MutableStateFlow<Long?>(null)
-    private val busyState = MutableStateFlow<Pair<Boolean, String>>(false to "")
+    private val busyState = MutableStateFlow<Triple<Boolean, String, Float?>>(Triple(false, "", null))
     private val recentPdfResult = MutableStateFlow<PdfFileModel?>(null)
     private val statusMessage = MutableStateFlow<String?>(null)
 
@@ -53,7 +61,7 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
         val tab: VaultTab,
         val query: String,
         val folderId: Long?,
-        val busy: Pair<Boolean, String>,
+        val busy: Triple<Boolean, String, Float?>,
         val recentPdf: PdfFileModel?,
         val message: String?
     )
@@ -84,7 +92,8 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
             val matchesQuery = q.isEmpty() ||
                 doc.title.lowercase().contains(q) ||
                 doc.tag.lowercase().contains(q) ||
-                (doc.folderName?.lowercase()?.contains(q) == true)
+                (doc.folderName?.lowercase()?.contains(q) == true) ||
+                doc.pages.any { it.ocrText.lowercase().contains(q) }
             matchesFolder && matchesQuery
         }
 
@@ -105,6 +114,7 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
             pdfs = filteredPdfs,
             isBusy = criteria.busy.first,
             busyMessage = criteria.busy.second,
+            busyProgress = criteria.busy.third,
             recentPdfResult = criteria.recentPdf,
             statusMessage = criteria.message
         )
@@ -140,6 +150,10 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
         recentPdfResult.value = null
     }
 
+    fun showMessage(msg: String) {
+        statusMessage.value = msg
+    }
+
     fun createFolder(name: String) {
         viewModelScope.launch {
             val id = repository.createFolder(name)
@@ -163,14 +177,19 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
     ) {
         if (files.isEmpty()) return
         viewModelScope.launch {
-            runBusy("Processing ${files.size} page(s)…") {
+            runBusy("Processing ${files.size} page(s)…", 0f) {
                 val docId = repository.createDocumentFromImageFiles(
                     imageFiles = files,
                     folderId = selectedFolderId.value,
                     autoDetectCorners = autoDetectCorners
-                )
+                ) { done, total ->
+                    busyState.value = Triple(true, "Processing $done / $total…", done.toFloat() / total.coerceAtLeast(1))
+                }
                 files.forEach { it.delete() }
-                if (docId > 0) onCreated(docId)
+                if (docId > 0) {
+                    onCreated(docId)
+                    launchOcrIndexingQuietly(docId)
+                }
             }
         }
     }
@@ -178,13 +197,19 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
     fun createDocumentFromGallery(uris: List<Uri>, onCreated: (Long) -> Unit) {
         if (uris.isEmpty()) return
         viewModelScope.launch {
-            runBusy("Importing ${uris.size} image(s)…") {
+            runBusy("Importing 0 / ${uris.size}…", 0f) {
                 val docId = repository.createDocumentFromUris(
                     uris = uris,
                     folderId = selectedFolderId.value
-                )
-                if (docId > 0) onCreated(docId)
-                else statusMessage.value = "Could not load selected image"
+                ) { done, total ->
+                    busyState.value = Triple(true, "Importing $done / $total…", done.toFloat() / total.coerceAtLeast(1))
+                }
+                if (docId > 0) {
+                    onCreated(docId)
+                    launchOcrIndexingQuietly(docId)
+                } else {
+                    statusMessage.value = "Could not load selected image"
+                }
             }
         }
     }
@@ -192,8 +217,11 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
     fun addPagesFromGallery(documentId: Long, uris: List<Uri>) {
         if (uris.isEmpty()) return
         viewModelScope.launch {
-            runBusy("Adding pages…") {
-                repository.addPagesFromUris(documentId, uris)
+            runBusy("Adding 0 / ${uris.size}…", 0f) {
+                repository.addPagesFromUris(documentId, uris) { done, total ->
+                    busyState.value = Triple(true, "Adding $done / $total…", done.toFloat() / total.coerceAtLeast(1))
+                }
+                launchOcrIndexingQuietly(documentId)
             }
         }
     }
@@ -204,6 +232,7 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
                 repository.addPageFromFile(documentId, file, autoDetectCorners)
                 file.delete()
                 onDone()
+                launchOcrIndexingQuietly(documentId)
             }
         }
     }
@@ -215,6 +244,13 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
                 file.delete()
                 onDone()
             }
+        }
+    }
+
+    fun duplicatePage(pageId: Long) {
+        viewModelScope.launch {
+            val newId = repository.duplicatePage(pageId)
+            if (newId > 0) statusMessage.value = "Page duplicated"
         }
     }
 
@@ -244,23 +280,116 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
-    fun applyFilter(pageId: Long, mode: FilterMode) {
+    fun applyFilterAndAdjust(
+        pageId: Long,
+        mode: FilterMode,
+        contrastBoost: Float,
+        brightnessOffset: Float
+    ) {
         viewModelScope.launch {
             runBusy("Applying ${mode.label}…") {
-                repository.applyFilterToPage(pageId, mode)
+                repository.applyFilterAndAdjustToPage(pageId, mode, contrastBoost, brightnessOffset)
             }
         }
     }
 
     fun applyFilterToAll(documentId: Long, mode: FilterMode) {
         viewModelScope.launch {
-            runBusy("Updating all pages…") {
+            runBusy("Updating pages…", 0f) {
                 repository.applyFilterToAllPages(documentId, mode)
             }
         }
     }
 
-    fun quickRotatePage(pageId: Long, currentCorners: QuadCorners, newRotation: Int, flipH: Boolean, mode: FilterMode) {
+    fun batchApplyFilter(documentId: Long, pageIds: Set<Long>, mode: FilterMode) {
+        if (pageIds.isEmpty()) return
+        viewModelScope.launch {
+            runBusy("Filtering ${pageIds.size} page(s)…", 0f) {
+                repository.batchApplyFilter(documentId, pageIds, mode) { done, total ->
+                    busyState.value = Triple(true, "Filtering $done / $total…", done.toFloat() / total.coerceAtLeast(1))
+                }
+            }
+        }
+    }
+
+    fun batchRotatePages(documentId: Long, pageIds: Set<Long>) {
+        if (pageIds.isEmpty()) return
+        viewModelScope.launch {
+            runBusy("Rotating ${pageIds.size} page(s)…", 0f) {
+                repository.batchRotatePages(documentId, pageIds, 90) { done, total ->
+                    busyState.value = Triple(true, "Rotating $done / $total…", done.toFloat() / total.coerceAtLeast(1))
+                }
+            }
+        }
+    }
+
+    fun batchAutoCropPages(documentId: Long, pageIds: Set<Long>) {
+        if (pageIds.isEmpty()) return
+        viewModelScope.launch {
+            runBusy("Auto-cropping ${pageIds.size} page(s)…", 0f) {
+                repository.batchAutoCropPages(documentId, pageIds) { done, total ->
+                    busyState.value = Triple(true, "Auto-cropping $done / $total…", done.toFloat() / total.coerceAtLeast(1))
+                }
+            }
+        }
+    }
+
+    fun batchDeletePages(documentId: Long, pageIds: Set<Long>) {
+        if (pageIds.isEmpty()) return
+        viewModelScope.launch {
+            repository.batchDeletePages(documentId, pageIds)
+            statusMessage.value = "Removed ${pageIds.size} page(s)"
+        }
+    }
+
+    fun extractOcrForPage(pageId: Long, onResult: (String) -> Unit) {
+        viewModelScope.launch {
+            runBusy("Reading text offline…") {
+                val text = repository.extractOcrForPage(pageId)
+                onResult(text)
+            }
+        }
+    }
+
+    private fun launchOcrIndexingQuietly(documentId: Long) {
+        viewModelScope.launch(Dispatchers.IO) {
+            runCatching { repository.indexDocumentOcrQuietly(documentId) }
+        }
+    }
+
+    fun stampSignatureOnPage(
+        pageId: Long,
+        strokes: List<List<NormalizedPoint>>,
+        placement: SignaturePlacement,
+        inkColorInt: Int
+    ) {
+        viewModelScope.launch {
+            runBusy("Signing page…") {
+                repository.stampSignatureOnPage(pageId, strokes, placement, inkColorInt)
+            }
+        }
+    }
+
+    fun drawStrokesOnPage(
+        pageId: Long,
+        strokes: List<DrawStroke>
+    ) {
+        if (strokes.isEmpty()) return
+        viewModelScope.launch {
+            runBusy("Saving drawing…") {
+                repository.drawStrokesOnPage(pageId, strokes)
+            }
+        }
+    }
+
+    fun savePageToGallery(imagePath: String, title: String) {
+        viewModelScope.launch(Dispatchers.IO) {
+            val saved = ShareUtils.saveImageToGallery(getApplication(), File(imagePath), title)
+            statusMessage.value = if (saved) "Saved to Pictures/NaimScanner" else "Use PDF export to share"
+        }
+    }
+
+    fun quickRotatePage(pageId: Long, currentCorners: QuadCorners, newRotation: Int, flipH: Boolean, mode: FilterMode, contrast: Float, brightness: Float) {
         viewModelScope.launch {
             runBusy("Rotating…") {
                 repository.updatePageTransformAndFilter(
@@ -268,7 +397,9 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
                     corners = currentCorners,
                     rotationDegrees = newRotation,
                     flipHorizontal = flipH,
-                    filterMode = mode
+                    filterMode = mode,
+                    contrastBoost = contrast,
+                    brightnessOffset = brightness
                 )
             }
         }
@@ -282,6 +413,12 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
         mutable.add(toIndex, moved)
         viewModelScope.launch {
             repository.reorderPages(documentId, mutable)
+        }
+    }
+
+    fun reorderAllPages(documentId: Long, orderedIds: List<Long>) {
+        viewModelScope.launch {
+            repository.reorderPages(documentId, orderedIds)
         }
     }
 
@@ -322,18 +459,26 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
         title: String,
         pageSize: PdfPageSize,
         qualityPreset: PdfQualityPreset,
+        pageLayout: PdfPageLayout,
+        margin: PdfMargin,
         watermarkText: String,
-        password: String
+        includePageNumbers: Boolean,
+        password: String,
+        selectedPageIds: Set<Long>? = null
     ) {
         viewModelScope.launch {
-            runBusy("Building PDF…") {
+            runBusy("Building ${qualityPreset.label} PDF…") {
                 val result = repository.exportDocumentToPdf(
                     documentId = documentId,
                     pdfTitle = title,
                     pageSize = pageSize,
                     qualityPreset = qualityPreset,
+                    pageLayout = pageLayout,
+                    margin = margin,
                     watermarkText = watermarkText,
-                    password = password
+                    includePageNumbers = includePageNumbers,
+                    password = password,
+                    selectedPageIds = selectedPageIds
                 )
                 if (result != null) {
                     recentPdfResult.value = result
@@ -383,25 +528,134 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
-    fun splitExtractPdf(
+    fun splitOrReorderPdf(
         sourcePdfId: Long,
-        zeroBasedIndices: List<Int>,
+        zeroBasedOrder: List<Int>,
         title: String,
         onDone: (PdfFileModel?) -> Unit
     ) {
         viewModelScope.launch {
-            runBusy("Extracting ${zeroBasedIndices.size} page(s)…") {
+            runBusy("Saving ${zeroBasedOrder.size} page(s)…") {
                 runCatching {
-                    repository.splitExtractPdf(sourcePdfId, zeroBasedIndices, title)
+                    repository.splitOrReorderPdf(sourcePdfId, zeroBasedOrder, title)
                 }.onSuccess { result ->
                     if (result != null) {
                         recentPdfResult.value = result
                     }
                     onDone(result)
                 }.onFailure {
-                    statusMessage.value = "Cannot extract from locked PDF"
+                    statusMessage.value = "Cannot edit password-locked PDF"
                     onDone(null)
                 }
+            }
+        }
+    }
+
+    fun compressPdf(sourcePdfId: Long, qualityPreset: PdfQualityPreset) {
+        viewModelScope.launch {
+            runBusy("Compressing PDF…") {
+                runCatching {
+                    repository.compressPdf(sourcePdfId, qualityPreset)
+                }.onSuccess { pair ->
+                    if (pair != null) {
+                        val (newPdf, oldSize) = pair
+                        activeTab.value = VaultTab.PDFS
+                        recentPdfResult.value = newPdf
+                        statusMessage.value = "${PdfEngine.formatFileSize(oldSize)} → ${PdfEngine.formatFileSize(newPdf.sizeBytes)}"
+                    } else {
+                        statusMessage.value = "Compression failed"
+                    }
+                }.onFailure {
+                    statusMessage.value = "Cannot compress locked PDF"
+                }
+            }
+        }
+    }
+
+    fun protectPdf(sourcePdfId: Long, password: String) {
+        if (password.isBlank()) return
+        viewModelScope.launch {
+            runBusy("Locking PDF…") {
+                runCatching {
+                    repository.protectPdf(sourcePdfId, password.trim())
+                }.onSuccess { result ->
+                    if (result != null) {
+                        activeTab.value = VaultTab.PDFS
+                        recentPdfResult.value = result
+                    } else {
+                        statusMessage.value = "Failed to lock PDF"
+                    }
+                }.onFailure {
+                    statusMessage.value = "Cannot lock this PDF"
+                }
+            }
+        }
+    }
+
+    fun convertPdfToScan(sourcePdfId: Long, onCreated: (Long) -> Unit) {
+        viewModelScope.launch {
+            runBusy("Converting PDF pages…") {
+                runCatching {
+                    repository.convertPdfToScanDocument(sourcePdfId)
+                }.onSuccess { docId ->
+                    if (docId > 0) {
+                        activeTab.value = VaultTab.SCANS
+                        onCreated(docId)
+                    } else {
+                        statusMessage.value = "Cannot extract locked PDF"
+                    }
+                }.onFailure {
+                    statusMessage.value = "Cannot convert locked PDF"
+                }
+            }
+        }
+    }
+
+    fun annotatePdf(
+        sourcePdfId: Long,
+        annotationsByPage: Map<Int, List<DrawStroke>>,
+        saveAsCopy: Boolean,
+        onDone: (PdfFileModel?) -> Unit
+    ) {
+        if (annotationsByPage.values.all { it.isEmpty() }) {
+            onDone(null)
+            return
+        }
+        viewModelScope.launch {
+            runBusy("Saving PDF drawing…") {
+                runCatching {
+                    repository.annotatePdfWithStrokes(sourcePdfId, annotationsByPage, saveAsCopy)
+                }.onSuccess { result ->
+                    if (result != null) {
+                        statusMessage.value = if (saveAsCopy) "Saved ${result.title}" else "PDF updated"
+                    } else {
+                        statusMessage.value = "Failed to save PDF drawing"
+                    }
+                    onDone(result)
+                }.onFailure {
+                    statusMessage.value = "Cannot draw on locked PDF"
+                    onDone(null)
+                }
+            }
+        }
+    }
+
+    fun savePdfImagesToGallery(pdf: PdfFileModel) {
+        viewModelScope.launch(Dispatchers.IO) {
+            busyState.value = Triple(true, "Exporting pages as photos…", null)
+            try {
+                val tempDir = File(getApplication<Application>().cacheDir, "pdf_img_export_${System.currentTimeMillis()}")
+                val files = PdfEngine.renderPdfPagesToImageFiles(pdf.filePath, tempDir, 2600)
+                var savedCount = 0
+                files.forEachIndexed { idx, file ->
+                    if (ShareUtils.saveImageToGallery(getApplication(), file, "${pdf.title}_p${idx + 1}")) {
+                        savedCount++
+                    }
+                }
+                tempDir.deleteRecursively()
+                statusMessage.value = if (savedCount > 0) "Saved $savedCount photo(s) to Pictures/NaimScanner" else "Image export requires Android 10+"
+            } finally {
+                busyState.value = Triple(false, "", null)
             }
         }
     }
@@ -431,12 +685,16 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
         detected
     }
 
-    private suspend inline fun runBusy(message: String, crossinline block: suspend () -> Unit) {
-        busyState.value = true to message
+    private suspend inline fun runBusy(
+        message: String,
+        progress: Float? = null,
+        crossinline block: suspend () -> Unit
+    ) {
+        busyState.value = Triple(true, message, progress)
         try {
             block()
         } finally {
-            busyState.value = false to ""
+            busyState.value = Triple(false, "", null)
         }
     }
 }
