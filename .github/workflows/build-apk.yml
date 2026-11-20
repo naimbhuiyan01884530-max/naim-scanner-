@@ -7,6 +7,9 @@ on:
     branches: [ main, master ]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     name: Test & Build Debug APK
@@ -47,9 +50,22 @@ jobs:
       - name: Build Debug APK
         run: gradle :app:assembleDebug --no-daemon
 
+      - name: Prepare APK file
+        run: cp app/build/outputs/apk/debug/app-debug.apk NaimScanner-debug.apk
+
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
           name: NaimScanner-debug-apk
-          path: app/build/outputs/apk/debug/app-debug.apk
+          path: NaimScanner-debug.apk
+          compression-level: 0
           if-no-files-found: error
+
+      - name: Publish direct APK download (GitHub Release)
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: Naim Scanner APK (Build #${{ github.run_number }})
+          make_latest: true
+          files: NaimScanner-debug.apk
